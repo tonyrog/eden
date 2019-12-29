@@ -1,0 +1,6 @@
+{application, eden,
+ [{description, "EDEN DNA Utilities in Erlang"},
+  {vsn, git},
+  {env, []},
+  {applications,[kernel,stdlib]}
+  ]}.
