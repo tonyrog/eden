@@ -11,8 +11,6 @@
 -export([line/1, line/2]).
 -export([options/1, options/2]).
 
--import(lists, [reverse/1]).
-
 -ifdef(OTP_RELEASE). %% this implies 21 or higher
 -define(EXCEPTION(Class, Reason, Stacktrace), Class:Reason:Stacktrace).
 -define(GET_STACK(Stacktrace), Stacktrace).
@@ -239,10 +237,10 @@ scan_tokens(Fd,[C|Cs],Ln,Acc,Ts,Opt) ->
     if C =:= Opt#opt.fc ->
 	    scan_tokens(Fd,Cs,Ln,[token(Acc,Opt#opt.space)|Ts], Opt);
        C =:= Opt#opt.nl ->
-	    {reverse([token(Acc,Opt#opt.space)|Ts]),Cs,Ln+1};
+	    {lists:reverse([token(Acc,Opt#opt.space)|Ts]),Cs,Ln+1};
        C =:= Opt#opt.comment ->
 	    Cs1 = skip_line(Fd, Cs, Opt),
-	    {reverse([token(Acc,Opt#opt.space)|Ts]),Cs1,Ln};
+	    {lists:reverse([token(Acc,Opt#opt.space)|Ts]),Cs1,Ln};
        C =:= Opt#opt.quote ->
 	    scan_quote(Fd,Cs,Ln,C,Acc,Ts,Opt);
        C =:= Opt#opt.xquote ->
@@ -256,7 +254,7 @@ scan_tokens(Fd,[],Ln,Acc,Ts,Opt) ->
 	    if Acc =:= [], Ts =:= [] ->
 		    eof;
 	       true ->
-		    {reverse([token(Acc,Opt#opt.space)|Ts]),[],Ln}
+		    {lists:reverse([token(Acc,Opt#opt.space)|Ts]),[],Ln}
 	    end;
 	Cs ->
 	    scan_tokens(Fd,Cs,Ln,Acc,Ts,Opt)
@@ -270,7 +268,7 @@ scan_quote(Fd,[C|Cs],Ln,Q,Acc,Ts,Opt) ->
 	    if Opt#opt.qnl =:= true ->
 		    scan_quote(Fd,Cs,Ln+1,Q,[C|Acc],Ts,Opt);
 	       true ->
-		    {reverse([token(Acc,Opt#opt.space)|Ts]),Cs,Ln}
+		    {lists:reverse([token(Acc,Opt#opt.space)|Ts]),Cs,Ln}
 	    end;
        true ->
 	    scan_quote(Fd,Cs,Ln,Q,[C|Acc],Ts,Opt)
@@ -281,7 +279,7 @@ scan_quote(Fd,[],Ln,Q,Acc,Ts,Opt) ->
 	    if Acc =:= [], Ts =:= [] ->
 		    eof;
 	       true ->
-		    {reverse([token(Acc,Opt#opt.space)|Ts]),[],Ln}
+		    {lists:reverse([token(Acc,Opt#opt.space)|Ts]),[],Ln}
 	    end;
 	Data ->
 	    scan_quote(Fd,Data,Ln,Q,Acc,Ts,Opt)
@@ -312,13 +310,13 @@ is_empty([_|_]) -> false;
 is_empty([]) -> true.
 
 token(Rev,keep) -> %% keep blanks
-    reverse(Rev);
+    lists:reverse(Rev);
 token(Rev,trim) -> %% trim of blanks
-    trim(reverse(trim(Rev)));
+    trim(lists:reverse(trim(Rev)));
 token([],normalize) -> %% trim blanks but leave a blank if none empty
     [];
 token(Rev,normalize) -> 
-    case reverse(trim(Rev)) of
+    case lists:reverse(trim(Rev)) of
 	[] -> " ";
 	Tok -> trim(Tok)
     end.

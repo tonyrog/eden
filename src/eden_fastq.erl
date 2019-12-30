@@ -11,41 +11,54 @@
 
 -compile(export_all).
 
--define(CHUNK_SIZE, 1024).
+-ifdef(OTP_RELEASE). %% this implies 21 or higher
+-define(EXCEPTION(Class, Reason, Stacktrace), Class:Reason:Stacktrace).
+-define(GET_STACK(Stacktrace), Stacktrace).
+-else.
+-define(EXCEPTION(Class, Reason, _), Class:Reason).
+-define(GET_STACK(_), erlang:get_stacktrace()).
+-endif.
+
+%% -define(dbg(F,A), io:format((F),(A))).
+-define(dbg(F,A), ok).
+
 
 scan(File) ->
-    scan(File,verify,0).
+    scan(File,".*",[]).
 
-scan(File,Pattern) ->
-    scan(File,Pattern,0).
+scan(File,RE) ->
+    scan(File,RE,[global],0).
 
-scan(File,verify,N) ->
-    scan(File,"",N);
-scan(File,all,N) ->
-    scan(File,".*",N);
-scan(File,Pattern,N) when is_integer(N), N >= 0->
-    try scan_(File,Pattern,N) of
+scan(File,RE,REOpts) ->
+    scan(File,RE,REOpts,0).
+
+scan(File,RE,REOpts,N) when is_integer(N), N >= 0->
+    try scan_(File,RE,REOpts,N) of
 	R -> R
     catch
 	throw:limit ->
 	    limit
     end.
 
-scan_(File,Pattern,N) ->
-    {ok,RE} = re:compile(Pattern),
+scan_(File,RE,REOpts,N) ->
+    {ok,REComp} = re:compile(RE),
     fold(File,
-	 fun(Rec=[ID,SEQ,_,Q], RecNo0) ->
+	 fun([_Id,Seq,_Plus,Qual], RecNo0) ->
 		 RecNo = RecNo0+1,
+		 ?dbg("RecNo: ~w\n", [RecNo]),
+		 ?dbg(" Seqid = ~p\n", [_Id]),
+		 ?dbg(" Seq = ~p\n", [Seq]),
+		 ?dbg(" Qual = ~w\n", [decode_quality(Qual)]),
 		 %% verify Rec
-		 if byte_size(SEQ) =/= byte_size(Q) ->
-			 io:format("~w, warning sequence size = ~w, quality size = ~w\n", [RecNo, byte_size(SEQ), byte_size(Q)]);
+		 if byte_size(Seq) =/= byte_size(Qual) ->
+			 io:format("~w, warning sequence size = ~w, quality size = ~w\n", [RecNo, byte_size(Seq), byte_size(Qual)]);
 		    true ->
 			 ok
 		 end,
-		 case re:run(ID, RE) of
+		 case re:run(Seq, REComp, REOpts) of
 		     nomatch -> ok;
-		     {match,_} ->
-			 io:format("~w: ~p\n", [RecNo, Rec])
+		     {match,M} ->
+			 io:format("match: ~w\n", [M])
 		 end,
 		 if N > 0, RecNo >= N ->
 			 throw(limit);
@@ -68,72 +81,53 @@ fold(File, Fun, Acc) ->
 	    try fold_(Fd, Fun, Acc) of
 		R -> R
 	    catch
-		error:Code:Stack ->
-		    io:format("crash: ~p\n", [Stack]),
+		?EXCEPTION(error,Code,Stack) ->
+		    io:format("crash: ~p\n", [?GET_STACK(Stack)]),
 		    {error,Code}
 	    end;
 	Error ->
 	    Error
     end.
 
-fold_(Fd, Fun, Acc) ->
-    fold_(Fd, <<>>, [], Fun, Acc).
-
-fold_(Fd, Buf, Rec, Fun, Acc) ->
-    case file:read(Fd, ?CHUNK_SIZE) of
-	eof ->
-	    case Rec of
-		[_ID,_SEQ,_PLUS,_Q] ->
-		    {eof, Fun(Rec, Acc), Buf};
-		[] ->
-		    {eof, Acc, Buf};
-		_ ->
-		    io:format("warn trailing lines: ~p\n", [Rec]),
-		    {eof, Acc, Buf}
-	    end;
-	{ok,Bin} ->
-	    split_(Fd, <<Buf/binary, Bin/binary>>, Rec, Fun, Acc)
+fold_(In, Fun, Acc) ->
+    case file:read_line(In) of
+	eof -> Acc;
+	{ok,<<"@",At/binary>>} ->
+	    fold1_(In, Fun, string:trim(At), [], Acc)
     end.
 
-split_(Fd, Buf, Rec, Fun, Acc) ->
-    case binary:split(Buf, <<$\n>>) of
-	[Ln,Buf1] ->
-	    case trim(Ln) of %% only check for empty lines!
-		<<>> ->
-		    split_(Fd, Buf1, Rec, Fun, Acc);
-		_ -> %% not trimmed!
-		    add_(Fd, Buf1, Ln, Rec, Fun, Acc)
-	    end;
-	[Buf1] ->
-	    fold_(Fd, Buf1, Rec, Fun, Acc)
+fold1_(In, Fun, At, CBuf, Acc) ->
+    case file:read_line(In) of
+	eof -> Acc; 
+	{ok,<<"+",Plus/binary>>} ->
+	    fold2_(In, Fun, At, string:trim(Plus), CBuf, [], Acc);
+	{ok,Chars} ->
+	    fold1_(In, Fun, At, [trim_nl(Chars)|CBuf], Acc)
     end.
 
-trim(<<$\s,Tail/binary>>) -> trim(Tail);
-trim(<<$\t,Tail/binary>>) -> trim(Tail);
-trim(Tail) -> Tail.
+fold2_(In, Fun, At, Plus, CBuf, QBuf, Acc) ->
+    case file:read_line(In) of
+	eof -> 
+	    CBuf1 = iolist_to_binary(lists:reverse(CBuf)),
+	    QBuf1 = iolist_to_binary(lists:reverse(QBuf)),
+	    Fun([At,CBuf1,Plus,QBuf1], Acc);
+	{ok,<<"@",At1/binary>>} ->
+	    CBuf1 = iolist_to_binary(lists:reverse(CBuf)),
+	    QBuf1 = iolist_to_binary(lists:reverse(QBuf)),
+	    Acc1 = Fun([At,CBuf1,Plus,QBuf1], Acc),
+	    fold1_(In, Fun, string:trim(At1), [], Acc1);
+	{ok,Qual} ->
+	    fold2_(In, Fun, At, Plus, CBuf, [trim_nl(Qual)|QBuf], Acc)
+    end.
 
-add_(Fd, Buf1, ID = <<$@,_/binary>>, [], Fun, Acc) ->
-    split_(Fd, Buf1, [ID], Fun, Acc);
-add_(Fd, Buf1, ID1 = <<$@,_/binary>>, Rec=[_ID,_SEQ,_PLUS,_Q], Fun, Acc) ->
-    Acc1 = Fun(Rec, Acc),
-    split_(Fd, Buf1, [ID1], Fun, Acc1);
-add_(Fd, Buf1, SEQ, [ID], Fun, Acc) ->
-    split_(Fd, Buf1, [ID,SEQ], Fun, Acc);
-add_(Fd, Buf1, PLUS = <<$+,_/binary>>, [ID,SEQ], Fun, Acc) ->
-    %% used?
-    split_(Fd, Buf1, [ID,SEQ,PLUS], Fun, Acc);
-add_(Fd, Buf1, SEQ1, [ID,SEQ], Fun, Acc) ->
-    SEQ1t = trim(SEQ1),
-    split_(Fd, Buf1, [ID,<<SEQ/binary,SEQ1t/binary>>], Fun, Acc);
-add_(Fd, Buf1, Q, [ID,SEQ,PLUS], Fun, Acc) ->
-    split_(Fd, Buf1, [ID,SEQ,PLUS,Q], Fun, Acc);
-add_(Fd, Buf1, Q1, [ID,SEQ,PLUS,Q], Fun, Acc) ->
-    Q1t = trim(Q1),
-    split_(Fd, Buf1, [ID,SEQ,PLUS,<<Q/binary,Q1t/binary>>], Fun, Acc);
-add_(Fd, Buf1, _Skip, Rec, Fun, Acc) ->
-    io:format("skip ~p\n", [_Skip]),  %% restart?
-    split_(Fd, Buf1, Rec, Fun, Acc).
-    
+trim_nl(Bin) ->
+    Size = byte_size(Bin)-1,
+    case Bin of
+	<<Bin1:Size/binary,"\n">> -> Bin1;
+	_ -> Bin
+    end.
+
+
 decode_quality(Q) ->
     list_to_tuple([ decode_q(C, sanger) || <<C>> <= Q ]).
 

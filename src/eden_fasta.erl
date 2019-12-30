@@ -9,33 +9,42 @@
 
 -compile(export_all).
 
+-ifdef(OTP_RELEASE). %% this implies 21 or higher
+-define(EXCEPTION(Class, Reason, Stacktrace), Class:Reason:Stacktrace).
+-define(GET_STACK(Stacktrace), Stacktrace).
+-else.
+-define(EXCEPTION(Class, Reason, _), Class:Reason).
+-define(GET_STACK(_), erlang:get_stacktrace()).
+-endif.
+
+
 scan(File) ->
     scan(File,".*",[]).
 
 %% Hint: search repeating structures (ACGT){n,m}
 %% find from n to m repeats of ACGT in sample data
-scan(File,Pattern) ->
-    scan(File,Pattern,[global],0).
+scan(File,RE) ->
+    scan(File,RE,[global],0).
 
-scan(File,Pattern,Opts) ->
-    scan(File,Pattern,Opts,0).
+scan(File,RE,REOpts) ->
+    scan(File,RE,REOpts,0).
     
-scan(File,Pattern,MatchOpts,N) when is_integer(N), N >= 0->
-    try scan_(File,Pattern,MatchOpts,N) of
+scan(File,RE,REOpts,N) when is_integer(N), N >= 0->
+    try scan_(File,RE,REOpts,N) of
 	R -> R
     catch
 	throw:limit ->
 	    limit
     end.
 
-scan_(File,Pattern,MatchOpts,N) ->
-    {ok,RE} = re:compile(Pattern),
+scan_(File,RE,REOpts,N) ->
+    {ok,REComp} = re:compile(RE),
     fold(File,
 	 fun([ID,Pos,SEQ], RecNo0) ->
 		 io:format("~w: id=~s, length=~p\n", 
 			   [Pos,ID,byte_size(SEQ)]),
 		 RecNo = RecNo0+1,
-		 case re:run(SEQ, RE, MatchOpts) of
+		 case re:run(SEQ, REComp, REOpts) of
 		     nomatch -> ok;
 		     {match,M} -> 
 			 io:format("match: ~w\n", [M])
@@ -61,7 +70,7 @@ fold(File, Fun, Acc) ->
 	    try fold_(Fd, Fun, Acc) of
 		R -> R
 	    catch
-		error:Code:Stack ->
+		?EXCEPTION(error,Code,Stack) ->
 		    io:format("crash: ~p\n", [Stack]),
 		    {error,Code}
 	    end;
@@ -94,14 +103,14 @@ fold_(In, Pos, ID, Buf, Fun, Acc) ->
 		    fold_(In,Pos+byte_size(Data),NextID,[],Fun,Acc1)
 	    end;
 	{ok,Bin} ->
-	    %% remove the trailing newline
-	    Size = byte_size(Bin)-1,
-	    case Bin of
-		<<Line:Size,"\n">> ->
-		    fold_(In,Pos,ID,[Line|Buf],Fun,Acc);
-		_ ->
-		    fold_(In,Pos,ID,[Bin|Buf],Fun,Acc)
-	    end
+	    fold_(In,Pos,ID,[trim_nl(Bin)|Buf],Fun,Acc)
+    end.
+
+trim_nl(Bin) ->
+    Size = byte_size(Bin)-1,
+    case Bin of
+	<<Bin1:Size,"\n">> -> Bin1;
+	_ -> Bin
     end.
 
 open_read(File) ->
