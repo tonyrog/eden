@@ -8,44 +8,29 @@
 -module(eden_edit).
 
 %% API
--export([start/0]).
--export([dna/1]).
--export([use_dna/1]).
--export([base/1]).
-
+-export([start/0, start/1]).
+-export([file/1]).
+-export([set_dna/1]).
+-export([demo/0]).
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3, format_status/2]).
+-compile(export_all).
 
 -define(SERVER, ?MODULE).
 
 -define(BASE_WIDTH,  16).
 -define(BASE_HEIGHT, 32).
+-define(SEL_HEIGHT,  4).
 
--define(ELLIPSE,   0).
--define(RECTANGLE, 1).
--define(ROUNDRECT, 2).
--define(TRIANGLE,  3).
+-define(TOP_OFFSET,    8).
+-define(BOTTOM_OFFSET, 4).
+-define(LEFT_OFFSET,   32).
+-define(RIGHT_OFFSET,  4).
 
--define(A,  (2#1000)).
--define(C,  (2#0100)).
--define(G,  (2#0010)).
--define(T,  (2#0001)).
-%%
--define(U,  (2#0001)).  %% RNA
--define(W,  (?A+?T)).
--define(S,  (?C+?G)).
--define(M,  (?A+?C)).
--define(K,  (?G+?T)).
--define(R,  (?A+?G)).
--define(Y,  (?C+?T)).
--define(B,  (?C+?G+?T)).
--define(D,  (?A+?G+?T)).
--define(H,  (?A+?C+?T)).
--define(V,  (?A+?C+?G)).
--define(N,  (?A+?C+?G+?T)).
--define(Z,  (0)).
--define(COMPLEMENT(X), base_reverse((X))).
+-define(MIN_ZOOM, -10).
+-define(MAX_ZOOM,  10).
+-define(MIN_OFFSET, -100).
 
 -define(WIDTH,  800).
 -define(HEIGHT, 480).
@@ -56,6 +41,8 @@
 -define(WHITE, grey5).
 -define(BLACK, grey10).
 
+-define(TEXT_COLOR,              {0,0,0,0}).       %% black text
+
 -include_lib("epx/include/epx_menu.hrl").
 -include_lib("epx/include/epx_window_content.hrl").
 
@@ -63,29 +50,25 @@
 -record(profile,
 	{
 	 scheme                        = logo, %% xterm,
+	 zoom                          = 0,    %% 100%
 	 screen_color                  = grey2,
 	 selection_alpha               = 100,
 	 selection_color               = grey,
 	 selection_border_width        = 1,
 	 selection_border_color        = ?BLACK,
-	 vertex_shape                  = ellipse,
-	 vertex_width                  = 16,
-	 vertex_height                 = 16,
-	 vertex_color                  = grey5,
-	 vertex_border_width           = 1,
-	 vertex_border_color           = ?BLACK,
-	 vertex_select_color           = green2,
-	 vertex_select_border_width    = 2,
-	 vertex_select_border_color    = ?BLACK,
-	 vertex_highlight_color        = grey6,
-	 vertex_highlight_border_width = 2,
-	 vertex_highlight_border_color = red,
-	 edge_color                    = 0,
-	 edge_select_color             = green2,
-	 edge_highlight_color          = ?WHITE,
+	 base_width                    = ?BASE_WIDTH,
+	 base_height                   = ?BASE_HEIGHT,
+	 border_width                  = 1,
+	 border_color                  = ?BLACK,
+	 select_color                  = ?WHITE,
+	 select_border_width           = 2,
+	 select_border_color           = ?BLACK,
+	 highlight_color               = grey6,
+	 highlight_border_width        = 2,
+	 highlight_border_color        = red,
 	 label_font                    = "Arial",
 	 label_font_size               = 12,
-	 label_font_color              = ?WHITE,
+	 label_font_color              = ?BLACK,
 	 label_background_color        = ?BLACK,
 	 label_border_color            = yellow,
 	 menu_font_name                = "Arial",
@@ -104,17 +87,29 @@
 	 top_bar_color                 = red,
 	 left_bar_color                = green,
 	 right_bar_color               = blue,
-	 bottom_bar_color              = white
+	 bottom_bar_color              = ?WHITE
 	}).
 
-	 
+-record(fi,
+	{
+	 font,
+	 size,
+	 width,
+	 height,
+	 ascent 
+	}).
+
 -record(state,
 	{
 	 backend,
 	 window,
-	 pixels,
-	 width,
-	 height,
+	 screen,          %% on-screen pixels
+	 pixels,          %% off-screen pixels
+	 grid,            %% grid pixels
+	 width,           %% width of screen and pixels
+	 height,          %% height of screen and pixels
+	 gwidth,          %% width of grid pixels
+	 gheight,         %% height of grid pixels
 	 profile,         %% color profile
 	 pt,              %% last button press position
 	 pt1,
@@ -122,29 +117,80 @@
 	 operation = none :: none | menu | select | move | vertex | edge,
 	 selected = [],   %% list of selected bases
 	 keymod = #keymod{}, %% modifiers
-	 graph,             %% the DNA data
-	 grid,            %% undefined | {Xstep,Ystep}
-	 zoom = 1,        %% zoom factor
-	 clip,            %% the cut/copy graph
+	 esc = false,        %% escape key
+	 dna,             %% the DNA data
+	 zoom = 0,        %% zoom factor -10 ... 10
+	 clip,            %% the cut/copy DNA
 	 menu,            %% global menu state
 	 winfo,
+	 view = base :: base | short | amino | compressed,
+	 color_map,       %% tuple that maps color 0..15 to RGB 
 	 font,
-	 fcolor
+	 font_list = [] :: [#fi{}],
+	 font_used = undefined :: #fi{},
+	 fcolor,
+	 pos      = 0,       %% upper left corner pos of DNA
+	 drows    = 0,       %% number of rows to draw (0 = all)
+	 ddir     = 0,       %% direction to update rows
+	 dpos     = 0,       %% draw pos rem nrows
+	 nrows    = 0,
+	 ncolumns = 0,
+	 noffs    = 0        %% ?MIN_OFFSET..0 update on ncolumns >= 1!
 	}).
+
 
 -define(SHIFT(State), (State#state.keymod)#keymod.shift).
 -define(CTRL(State), (State#state.keymod)#keymod.ctrl).
 -define(ALT(State), (State#state.keymod)#keymod.alt).
 
-use_dna(DNA) ->
-    gen_server:call(?SERVER, {use_dna, DNA}).
+demo() ->
+    file(filename:join(code:priv_dir(eden),"mt.fa.gz")).
+
 %%%===================================================================
 %%% API
 %%%===================================================================
+file([Filename]) when is_atom(Filename) ->
+    file0(atom_to_list(Filename));
+file(Filename)  when is_list(Filename), is_integer(hd(Filename)) ->
+    file0(Filename).
 
-dna(DNA) ->
-    start([true, {dna,DNA}]).
+file0(Filename) when is_list(Filename), is_integer(hd(Filename)) ->
+    case load_alt([{".fa.gz",{eden_fasta,load,[]}},
+		   {".fasta.gz",{eden_fasta,load,[]}},
+		   {".fa",{eden_fasta,load,[]}},
+		   {".fasta",{eden_fasta,load,[]}},
+		   
+		   {".fq.gz",{eden_fastq,load,[]}},
+		   {".fastq.gz",{eden_fastq,load,[]}},
+		   {".fq",{eden_fastq,load,[]}},
+		   {".fastq",{eden_fastq,load,[]}}
+		  ], Filename) of
+	{ok,DNA} ->
+	    case start() of
+		{ok,Pid} ->
+		    set_dna(Pid, DNA);
+		{error,{already_started,Pid}} ->
+		    set_dna(Pid, DNA);
+		Error ->
+		    Error
+	    end;
+	Error ->
+	    Error
+    end.
 
+set_dna(DNA) -> set_dna(?SERVER, DNA).
+set_dna(Pid, DNA) -> gen_server:call(Pid, {set_dna, DNA}).
+
+load_alt([{Ext, {Mod,Fun,Args}}|Alt], Filename) ->
+    case lists:suffix(Ext, Filename) of
+	true ->
+	    {ok, apply(Mod,Fun,[Filename|Args])};
+	false ->
+	    load_alt(Alt, Filename)
+    end;
+load_alt([], _Filename) ->
+    {error, bad_suffix}.
+    
 start() ->
     start([false]).
 
@@ -155,9 +201,9 @@ start([TTYLogger|Opts0]) ->
     application:set_env(epx, use_off_screen, ?USE_OFF_SCREEN),
     application:set_env(epx, use_exposure, ?USE_EXPOSURE),
     %% epx:debug(debug),
-    application:load(graph),
-    Width  = application:get_env(graph, screen_width, ?WIDTH),
-    Height = application:get_env(graph, screen_height, ?HEIGHT),
+    application:load(eden),
+    Width  = application:get_env(eden, screen_width, ?WIDTH),
+    Height = application:get_env(eden, screen_height, ?HEIGHT),
     application:ensure_all_started(epx),
     Opts = [{screen_width,Width},{screen_height,Height}|Opts0],
     gen_server:start({local, ?SERVER}, ?MODULE, Opts, []).
@@ -180,30 +226,43 @@ start([TTYLogger|Opts0]) ->
 init(Options) ->
     process_flag(trap_exit, true),
     %% options list override env
-    Env = Options ++ application:get_all_env(graph),
+    Env = Options ++ application:get_all_env(eden),
     Width  = proplists:get_value(screen_width, Env, ?WIDTH),
     Height = proplists:get_value(screen_height, Env, ?HEIGHT),
-    Graph = proplists:get_value(graph, Env, graph:new(false)),
     Profile = load_profile(Env),
     MenuProfile = create_menu_profile(Profile),
     Backend = epx_backend:default(),
-    {ok,Font} = epx_font:match([{name,Profile#profile.label_font},
-				{size,Profile#profile.label_font_size}]),
-    epx_gc:set_font(Font),
-    {W,H}  = epx_font:dimension(Font,"0"),
+    FontList =
+	[begin
+	     {ok,F} = epx_font:match([{name,Profile#profile.label_font},
+				      {weight, medium},
+				      {slant, roman},
+				      {size,Size}]),
+	     epx_gc:set_font(F),
+	     {W,H}  = epx_font:dimension(F,"G"),
+	     A = epx:font_info(F, ascent),
+	     #fi{font=F,size=Size,width=W,height=H,ascent=A}
+	 end || Size <- [10,12,14,16,18,
+			 20,22,24,26,28,
+			 30,32,34,36,38,
+			 40,42,44,46,48]],
+    Zoom = Profile#profile.zoom,
+    Zf = zoom_factor(Zoom),
+    [_,Fi0|_] = FontList,  %% pick out zoom=0 
+    FWidth = trunc(?BASE_WIDTH*Zf),  %% size we need to draw
+    Fi = find_base_font_(FWidth, FontList, undefined),
+
     WInfo = #window_info {
-	       glyph_width  = W,
-	       glyph_height = H,
-	       glyph_ascent = epx:font_info(Font, ascent),
-	       glyph_descent = epx:font_info(Font, descent),
+	       glyph_width  = Fi0#fi.width,
+	       glyph_height = Fi0#fi.height,
+	       glyph_ascent = Fi0#fi.ascent,
+	       glyph_descent = epx:font_info(Fi0#fi.font, descent),
 	       bottom_bar = 18
 	      },
-
     Events = 
 	[key_press,key_release,
 	 %% wheel, left, right, %% motion-left-button
-	 configure,    %% resize,
-	 button_press,button_release] ++
+	 configure,button_press,button_release] ++
 	case ?USE_EXPOSURE of
 	    true -> [expose];
 	    _ -> []
@@ -213,22 +272,65 @@ init(Options) ->
     epx:window_attach(Window, Backend),
     epx:window_adjust(Window, [{name, "EDEN"}]),
 
+    NRows = nrows(WInfo, Height, Zf),
+    NColumns = ncolumns(WInfo, Width, Zf),
+    GWidth = trunc(NColumns*Zf*?BASE_WIDTH),
+    GHeight = trunc(NRows*Zf*?BASE_HEIGHT),    
+    Grid = epx:pixmap_create(GWidth, GHeight, argb),
     Pixels = epx:pixmap_create(Width, Height, argb),
-    epx:pixmap_attach(Pixels, Backend),
+    Screen = epx:pixmap_create(Width, Height, argb),
+    epx:pixmap_attach(Screen, Backend),
 
     Menu = epx_menu:create(MenuProfile, menu(global)),
 
+    Scheme = Profile#profile.scheme,
+    Z   = epx_profile:color(Scheme,grey),
+    T   = epx_profile:color(Scheme,red),
+    G   = epx_profile:color(Scheme,yellow),
+    C   = epx_profile:color(Scheme,blue),
+    A   = epx_profile:color(Scheme,green),
+
+    FontColor = load_color(Scheme, label_font_color, Env, Profile),
+
+    ColorMap = erlang:make_tuple(256,Z,
+				 [{$A,color32(A)},
+				  {$C,color32(C)},
+				  {$G,color32(G)},
+				  {$T,color32(T)},
+				  {$W,color32(add_color(A,T))},
+				  {$S,color32(add_color(C,G))},
+				  {$M,color32(add_color(A,C))},
+				  {$K,color32(add_color(G,T))},
+				  {$R,color32(add_color(A,G))},
+				  {$Y,color32(add_color(C,T))},
+				  {$B,color32(add_color(C,G,T))},
+				  {$D,color32(add_color(A,G,T))},
+				  {$H,color32(add_color(A,C,T))},
+				  {$V,color32(add_color(A,C,G))},
+				  {$N,color32(add_color(A,C,G,T))}]),
+
     State = #state{ backend = Backend,
-		    window = Window,
-		    pixels = Pixels,
+		    window  = Window,
+		    screen  = Screen,   %% screen pixels
+		    pixels  = Pixels,   %% off-screen pixels
+		    grid    = Grid,
 		    profile = Profile,
-		    width  = Width,
-		    height = Height,
-		    menu   = Menu,
-		    graph  = Graph,
-		    winfo  = WInfo,
-		    font = Font,
-		    fcolor = Profile#profile.label_font_color
+		    width   = Width,
+		    height  = Height,
+		    gwidth   = GWidth,
+		    gheight  = GHeight,
+		    menu    = Menu,
+		    dna     = <<>>,
+		    pos     = 0,
+		    winfo   = WInfo,
+		    color_map = ColorMap,
+		    font = Fi0#fi.font,
+		    font_list = FontList,
+		    font_used = Fi,
+		    fcolor = FontColor,
+		    zoom = Zoom,
+		    nrows = NRows,
+		    ncolumns = NColumns
 		  },
     invalidate(State),
     {ok, State}.
@@ -249,11 +351,12 @@ init(Options) ->
 			 {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
 			 {stop, Reason :: term(), NewState :: term()}.
 
-handle_call({use_dna,DNAStrand}, _From, State) ->
+handle_call({set_dna,DNAStrand}, _From, State) ->
     invalidate(State),
-    G = dna_layout(DNAStrand, graph:new(false)),
-    {reply, ok, State#state { graph = G,
-			      clip = undefined,
+    DNA = iolist_to_binary(DNAStrand),
+    {reply, ok, State#state { pos  = 0,
+			      dna = DNA,
+			      clip = <<>>,
 			      selected = []}};
 handle_call(_Request, _From, State) ->
     {reply, {error,bad_call}, State}.
@@ -337,12 +440,12 @@ format_status(_Opt, Status) ->
 handle_epx_event(Event, State) ->
     case Event of
 	{button_press, [left], _Where={Xm,Ym,_Zm}} ->
-	    XY = {X,Y} = izm(Xm,Ym,State#state.zoom),
+	    XY = {Xm,Ym},
 	    if 
 		State#state.operation =:= menu ->
 		    case epx_menu:find_row(State#state.menu, 
 					   State#state.pt1,
-					   {Xm,Ym}) of
+					   XY) of
 			{-1, _Menu} ->
 			    {noreply, State};
 			{_Row, Menu} ->
@@ -357,59 +460,34 @@ handle_epx_event(Event, State) ->
 				    {noreply, State2}
 			    end
 		    end;
-	       ?CTRL(State) ->  %% Add vertex
-		    Profile = State#state.profile, 
-		    Color = Profile#profile.vertex_color,
-		    Width = Profile#profile.vertex_width,
-		    Height = Profile#profile.vertex_height,
-		    Shape = Profile#profile.vertex_shape,
-		    V = graph:unique_vertex(),
-		    G1 = graph:put_vertex(V,
-					  [{x,X},{y,Y},
-					   {color,Color},
-					   {height,Height},
-					   {width,Width},
-					   {shape,Shape}],
-					  State#state.graph),
+	       ?CTRL(State) ->
 		    invalidate(State),
-		    {noreply, State#state { operation = vertex,
+		    {noreply, State#state { operation = none,
+					    selected = [],
 					    pt1 = XY,
-					    pt2 = XY,
-					    graph = G1 }};
+					    pt2 = XY }};
 
-		?ALT(State) ->  %% Add edge
-		    case select(XY,State#state.graph,[]) of
-			[] ->
-			    invalidate(State),
-			    {noreply, State#state { selected = [],
-						    operation = none }};
-			[V|_] ->
-			    Window = State#state.window,
-			    epx:window_enable_events(Window,[motion]),
-			    invalidate(State),
-			    {noreply, State#state { operation = edge,
-						    selected = [V],
-						    pt1 = XY, pt2 = XY
-						  }}
-		    end;
+		?ALT(State) ->
+		    {noreply, State#state { selected = [],
+					    operation = none }};
 
 	       true ->
 		    Window = State#state.window,
 		    epx:window_enable_events(Window,[motion]),
 		    invalidate(State),
 		    Sel0 = State#state.selected,
-		    case select(XY,State#state.graph,[]) of
+		    case select(State,XY,[]) of
 			[] ->
 			    Sel = if ?SHIFT(State) -> Sel0; true -> [] end,
 			    {noreply,
 			     State#state { operation = select,
 					   selected = Sel,
 					   pt1 = XY, pt2 = XY }};
-			[V|_] ->
-			    case lists:member(V, Sel0) of
+			[Pos] ->
+			    case lists:member(Pos,Sel0) of
 				true ->
 				    Sel = if ?SHIFT(State) ->
-						  Sel0 -- [V];
+						  Sel0 -- [Pos];
 					     true ->
 						  Sel0
 					  end,
@@ -419,14 +497,15 @@ handle_epx_event(Event, State) ->
 						   pt1 = XY, pt2 = XY }};
 				false ->
 				    if ?SHIFT(State) ->
+					    Selected = add_to_sel(Pos,Sel0),
 					    {noreply,
 					     State#state { operation = select,
-							   selected = [V|Sel0],
+							   selected = Selected,
 							   pt1 = XY, pt2 = XY}};
 				       true ->
 					    {noreply,
 					     State#state { operation = move,
-							   selected = [V],
+							   selected = [Pos],
 							   pt1 = XY, pt2 = XY}}
 				    end
 			    end
@@ -434,7 +513,7 @@ handle_epx_event(Event, State) ->
 	    end;
 
 	{button_release, [left], _Where={Xm,Ym,_Zm}} ->
-	    XY = izm(Xm,Ym,State#state.zoom),
+	    XY = {Xm,Ym},
 	    Window = State#state.window,
 	    epx:window_disable_events(Window,[motion]),
 	    State1 = State#state { pt = XY },
@@ -446,46 +525,22 @@ handle_epx_event(Event, State) ->
 		    Sel0 = State1#state.selected,
 		    case State1#state.operation of
 			move ->
-			    Offset = coords_sub(Pt2, Pt1),
-			    G = move_vertices(Sel0,Offset,State1#state.graph),
+			    _Offset = coords_sub(Pt2, Pt1),
+			    %% DNA = move_dna(Sel0,Offset,State1#state.dna),
 			    invalidate(State1),
 			    {noreply, State1#state { pt1 = undefined, 
 						     pt2 = undefined,
-						     operation = none,
-						     graph = G }};
+						     operation = none
+						   }};
 			select ->
 			    Rect = coords_to_rect(Pt1,Pt2),
 			    Sel1 = if ?SHIFT(State1) -> Sel0; true -> [] end,
-			    Sel = select_area(Rect,State1#state.graph,Sel1),
+			    Sel = select_area(State,Rect,Sel1),
 			    invalidate(State1),
 			    {noreply, State1#state { pt1 = undefined,
 						     pt2 = undefined,
 						     operation = none,
 						     selected = Sel }};
-			edge ->
-			    invalidate(State1),
-			    case select(XY,State1#state.graph,[]) of
-				[] ->
-				    {noreply, State1#state { pt1 = undefined,
-							     pt2 = undefined,
-							     operation = none }};
-				[W|_] when W =:= hd(State1#state.selected) ->
-				    {noreply, State1#state { pt1 = undefined,
-							     pt2 = undefined,
-							     operation = none }};
-				[W|_] ->
-				    [V] = State1#state.selected,
-				    Profile = State1#state.profile,
-				    EdgeColor = Profile#profile.edge_color,
-				    G = graph:put_edge(V, W, 
-						       [{color,EdgeColor}],
-						       State1#state.graph),
-				    {noreply, State1#state { pt1 = undefined,
-							     pt2 = undefined,
-							     selected = [W],
-							     graph = G,
-							     operation = none }}
-			    end;
 			_ ->
 			    invalidate(State1),
 			    {noreply, State1#state { pt1 = undefined,
@@ -506,46 +561,36 @@ handle_epx_event(Event, State) ->
 	    invalidate(State1),
 	    {noreply, State1};
 			  
-	{button_press,[wheel_down],{Xm,Ym,_Zm}} ->
-	    %% scale + selected graph
-	    XY = izm(Xm,Ym,State#state.zoom),
+	{button_press,[wheel_down],{_Xm,_Ym,_Zm}} ->
 	    flush_wheel(State#state.window),
-	    Selected = State#state.selected,
-	    Center = if ?SHIFT(State) ->
-			     graph_center(Selected,State#state.graph);
-			true ->
-			     XY
-		     end,
-	    G = scale_vertices(Selected, 1.2, Center, State#state.graph),
-	    State1 = State#state { graph = G },
+	    State1 = move_down(State, 1),
+	    %% Pos = State#state.pos + columns(State),
+	    %% State1 = State#state { pos = Pos },
 	    invalidate(State1),
 	    {noreply, State1};
+	{button_release,[wheel_down],_Coord} ->
+	    {noreply, State};
 
-	{button_press,[wheel_up],{Xm,Ym,_Zm}} ->
-	    %% scale - selected graph
-	    XY = izm(Xm,Ym,State#state.zoom),
+	{button_press,[wheel_up],{_Xm,_Ym,_Zm}} ->
 	    flush_wheel(State#state.window),
-	    Selected = State#state.selected,
-	    Center = if ?SHIFT(State) ->
-			     graph_center(Selected,State#state.graph);
-			true ->
-			     XY
-		     end,
-	    G = scale_vertices(Selected, 0.8, Center, State#state.graph),
-	    State1 = State#state { graph = G },
+	    State1 = move_up(State, 1),
+	    %% Pos = max(0, State#state.pos - columns(State)),
+	    %% State1 = State#state { pos = Pos },
 	    invalidate(State1),
 	    {noreply, State1};
+	{button_release,[wheel_up],_Coord} ->
+	    {noreply, State};
 
 	{button_press,[wheel_left],{_Xm,_Ym,_Zm}} ->
-	    %% resize +
-	    %% XY = izm(Xm,Ym,State#state.zoom),
 	    flush_wheel(State#state.window),
+	    {noreply, State};
+	{button_release,[wheel_left],_Coord} ->
 	    {noreply, State};
 	
 	{button_press,[wheel_right],{_Xm,_Ym,_Zm}} ->
-	    %% resize -
-	    %% XY = izm(Xm,Ym,State#state.zoom),
 	    flush_wheel(State#state.window),
+	    {noreply, State};
+	{button_release,[wheel_right],_Coord} ->
 	    {noreply, State};
 
 	{motion, [], {Xm,Ym,_Zm}} ->
@@ -568,7 +613,7 @@ handle_epx_event(Event, State) ->
 
 	{motion, [left], {Xm,Ym,_Zm}} ->
 	    flush_motions(State#state.window),
-	    XY = izm(Xm,Ym,State#state.zoom),
+	    XY = {Xm,Ym},
 	    case State#state.pt1 of
 		undefined ->
 		    {noreply, State};
@@ -578,12 +623,20 @@ handle_epx_event(Event, State) ->
 	    end;
 
 	{key_press, Sym, Mod, _code} ->
-	    %% io:format("Key press ~p mod=~p\n", [Sym,Mod]),
-	    M = set_mod(State#state.keymod, Mod),
-	    State1 = State#state { keymod=M },
-	    State2 = command(Sym, State1#state.selected, M, State1),
-	    invalidate(State2),
-	    {noreply, State2};
+	    if Sym =:= $\e -> %% escape key processing
+		    epx:window_disable_events(State#state.window,[motion]),
+		    if not State#state.esc ->
+			    {noreply, State#state { esc = true }};
+		       true ->
+			    {noreply, State}
+		    end;
+	       true ->
+		    M = set_mod(State#state.keymod, Mod),
+		    State1 = State#state { keymod=M },
+		    State2 = command(Sym, State1#state.selected, M, State1),
+		    invalidate(State2#state { esc = false }),
+		    {noreply, State2}
+	    end;
 
 	{key_release, _Sym, Mod, _code} ->
 	    %% %% io:format("Key release ~p mod=~p\n", [_Sym,Mod]),
@@ -591,30 +644,54 @@ handle_epx_event(Event, State) ->
 	    {noreply, State#state { keymod = M }};
 
 	{configure, {_X,_Y,W,H}} ->
-	    %% io:format("Configure x=~w,y=~w,w=~w,h=~w\n", [_X,_Y,W,H]),
-	    Pixels = resize_pixmap(State#state.pixels,W,H),
-	    State1 = State#state { pixels = Pixels, width=W, height=H },
-	    maybe_invalidate(not ?USE_EXPOSURE, State1),
+	    Zf = zoom_factor(State#state.zoom),
+	    NRows    = nrows(State#state.winfo, H, Zf),
+	    NColumns = ncolumns(State#state.winfo, W, Zf),
+	    M = max(1, NColumns+State#state.noffs),
+	    GW = trunc(M*Zf*?BASE_WIDTH),
+	    GH = trunc(NRows*Zf*?BASE_HEIGHT),
+	    Grid = resize_pixmap(State#state.grid,GW,GH,false),
+	    Screen = resize_pixmap(State#state.screen,W,H,true),
+	    
+	    %% Avoid flicker?
+	    epx:pixmap_copy_area(State#state.pixels,Screen,
+				 0, 0, 0, 0,
+				 State#state.width, State#state.height),
+	    epx:pixmap_draw(Screen, State#state.window,
+			    0, 0, 0, 0, W, H),
+	    epx:sync(Screen,State#state.window),
+
+	    Pixels = resize_pixmap(State#state.pixels,W,H,false),
+
+	    State1 = State#state { screen = Screen,
+				   pixels = Pixels,
+				   grid   = Grid,
+				   nrows  = NRows,
+				   ncolumns = NColumns,
+				   width=W, height=H,
+				   gwidth = GW, gheight = GH
+				 },
+	    invalidate(State1),
+	    %% maybe_invalidate(not ?USE_EXPOSURE, State1),
 	    {noreply, State1};
 
 	{expose, {_X,_Y,_W,_H}} ->
-	    %% io:format("Expose x=~w,y=~w,w=~w,h=~w\n", [_X,_Y,_W,_H]),
-	    draw(State),
-	    {noreply, State};
+	    io:format("Expose x=~w,y=~w,w=~w,h=~w\n", [_X,_Y,_W,_H]),
+	    State1 = draw(State),
+	    {noreply, State1};
 	
 	redraw ->
 	    flush_redraw(State),
-	    try draw(State) of
-		_ ->
-		    ok
-	    catch
-		error:Reason:Stack ->
-		    io:format("Error: ~p\n~p\n", [Reason,Stack])
-	    end,
-	    {noreply, State};
+	    State1 = try draw(State) of
+			 S1 -> S1
+		     catch
+			 error:Reason:Stack ->
+			     io:format("Error: ~p\n~p\n", [Reason,Stack]),
+			     State
+		     end,
+	    {noreply, State1};
 
 	close -> 
-	    erlang:halt(0),
 	    {stop,normal,State};
 
 	destroy ->
@@ -642,212 +719,249 @@ clr_mod(M, []) -> M.
 
 %%
 %% key commands:
-%%   up / down / left / right move selected graph
+%%   up / down / left / right move selected dna
 %%   ctrl 0 - 9               set color on selected vertices
 %%   alt  0 - 9               set shape on selected vertices
 %%   \b                       delete selected vertices
 %%   ctrl x                   cut selected vertices to clipboard
 %%   ctrl c                   copy selected vertices to clipboard
 %%   ctrl v                   paste graph from clipboard
-%%   ctrl s                   save graph go "graph.g"
-%%   C                        complete selected sub graph
-%%   I                        complement selected sub graph
-%%   G                        toggle snap to grid 
 %%   +                        zoom in
 %%   -                        zoom out
-%%   r                        find greedy coloring of graph
-%%   q                        find greedy clique
-%%   o                        find greedy vertex cover
 %%
-command(up, Selected, _Mod, State) ->
-    Dir = case State#state.grid of
-	      undefined -> {0,-1};
-	      {_Xs,Ys} -> {0,-Ys}
-	  end,
-    G = move_vertices(Selected, Dir, State#state.graph),
-    State#state { graph=G };
-command(down, Selected, _Mod, State) ->
-    Dir = case State#state.grid of
-	      undefined -> {0,1};
-	      {_Xs,Ys} -> {0,Ys}
-	  end,
-    G = move_vertices(Selected, Dir, State#state.graph),
-    State#state { graph=G };
-command(left, Selected, _Mod, State) ->
-    Dir = case State#state.grid of
-	      undefined -> {-1,0};
-	      {Xs,_Ys} -> {-Xs,0}
-	  end,
-    G = move_vertices(Selected, Dir, State#state.graph),
-    State#state { graph=G };
-command(right, Selected, _Mod, State) ->
-    Dir = case State#state.grid of
-	      undefined -> {1,0};
-	      {Xs,_Ys} -> {Xs,0}
-	  end,
-    G = move_vertices(Selected, Dir, State#state.graph),
-    State#state { graph=G };
-command(Command, Selected, Mod, State) when Command >= $0, Command =< $9,
-					    Mod#keymod.ctrl ->
-    G = set_vertices(Selected, [{color,Command-$0}],State#state.graph),
-    State#state { graph=G };
-command(Command, Selected, Mod, State) when Command >= $0, Command =< $9,
-					    Mod#keymod.alt ->
-    G = set_vertices(Selected, [{shape,shape(Command-$0)}],State#state.graph),
-    State#state { graph=G };
-command($\e, _Selected, _Mod, State) ->
-    %% escape from operation, fixme stop ongoing operations
-    epx:window_disable_events(State#state.window,[motion]),
-    State#state { operation = none };
-command($\b, Selected, _Mod, State) ->
-    G = kill_graph(Selected, State#state.graph),
-    State#state { graph=G, selected = [] };
-command($x, Selected, Mod, State) when Mod#keymod.ctrl ->
-    {G,Clip} = if Selected =:= [] ->
-		       {State#state.graph, State#state.clip};
-		  true ->
-		       cut_graph(Selected, State#state.graph)
-	       end,
-    State#state { graph=G, clip=Clip, selected = [] };
-command($c, Selected, Mod, State) when Mod#keymod.ctrl ->
-    G = if Selected =:= [] -> State#state.graph;
-	   true -> copy_graph(Selected, State#state.graph)
+command(up, _Selected, _Mod, State) ->
+    move_up(State,1);
+command($p, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    move_up(State, 1);
+command(pageup, _Selected, _Mod, State) ->
+    move_up(State,rows(State));
+%% command($v, _Selected, Mod, State) when State#state.esc ->
+%%    move_up(State,rows(State));
+command(down, _Selected, _Mod, State) ->
+    move_down(State,1);
+command($n, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    move_down(State,1);
+command(pagedown, _Selected, _Mod, State) ->
+    move_down(State,rows(State));
+%%command($v, _Selected, Mod, State) when Mod#keymod.ctrl ->
+%%    move_down(State,rows(State));
+command(left, _Selected, Mod, State) ->
+    if Mod#keymod.alt -> %% adjust ncolumns  %% ?MIN_OFFSET..0
+	    State1=State#state { noffs = max(?MIN_OFFSET,State#state.noffs-1)},
+	    M = columns(State1),
+	    Zf = zoom_factor(State1#state.zoom),
+	    GWidth = trunc(M*Zf*?BASE_WIDTH),
+	    State1#state { gwidth = GWidth };	    
+       true ->
+	    Pos = max(0, State#state.pos - 1),
+	    State#state { pos = Pos }
+    end;
+command(right, _Selected, Mod, State) ->
+    if Mod#keymod.alt -> %% adjust ncolumns  %% -16 0
+	    State1 = State#state { noffs = min(0, State#state.noffs+1) },
+	    M = columns(State1),
+	    Zf = zoom_factor(State1#state.zoom),
+	    GWidth = trunc(M*Zf*?BASE_WIDTH),
+	    State1#state { gwidth = GWidth };
+       true ->
+	    Pos = State#state.pos + 1,  %% fixme limit upwards!
+	    State#state { pos = Pos }
+    end;
+command(insert, Selected, Mod, State) ->
+    %% insert Z base after/before the selected base(s)
+    DNA = 
+	if Mod#keymod.alt ->
+		insert_data_before(Selected,State#state.dna,<<$Z>>);
+	   true ->
+		insert_data_after(Selected,State#state.dna,<<$Z>>)
 	end,
-    State#state { clip=G };
-command($v, _Selected, Mod, State) when Mod#keymod.ctrl ->
-    Pos = case State#state.pt of
-	      undefined ->
-		  zm({State#state.width div 2,State#state.height div 2},
-		     State#state.zoom);
-	      Pt -> Pt
+    State#state { dna = DNA };
+
+command($a, Selected, Mod, State) when not Mod#keymod.ctrl ->
+    DNA = replace_data(Selected, State#state.dna, <<$A>>),
+    State#state { dna = DNA };
+command($c, Selected, Mod, State) when not Mod#keymod.ctrl ->
+    DNA = replace_data(Selected, State#state.dna, <<$C>>),
+    State#state { dna = DNA };
+command($g, Selected, Mod, State) when not Mod#keymod.ctrl ->
+    DNA = replace_data(Selected, State#state.dna, <<$G>>),
+    State#state { dna = DNA };
+command($t, Selected, Mod, State)  when not Mod#keymod.ctrl ->
+    DNA = replace_data(Selected, State#state.dna, <<$T>>),
+    State#state { dna = DNA };
+command($z, Selected, Mod, State)  when not Mod#keymod.ctrl ->
+    DNA = replace_data(Selected, State#state.dna, <<$Z>>),
+    State#state { dna = DNA };
+command($\b, Selected, _Mod, State) ->
+    DNA = remove_data(Selected, State#state.dna),
+    State#state { dna = DNA, selected = [] };
+command($x, Selected, Mod, State) when Mod#keymod.ctrl ->
+    {DNA,Clip} = cut_data(Selected, State#state.dna),
+    State#state { dna=DNA, clip=Clip, selected = [] };
+command($c, Selected, Mod, State) when Mod#keymod.ctrl ->
+    Clip = copy_data(Selected, State#state.dna),
+    State#state { clip=Clip };
+command($v, Selected, Mod, State) when Mod#keymod.ctrl ->
+    DNA = paste_data(Selected, State#state.dna, State#state.clip),
+    State#state { dna=DNA, selected = [] };
+command($t, Selected, Mod, State) when Mod#keymod.ctrl ->
+    DNA = case Selected of 
+	      [] -> 
+		  State#state.dna;
+	      [Pos] ->
+		  toggle_data([Pos,Pos+1],State#state.dna);
+	      _ ->
+		  toggle_data(Selected, State#state.dna)
 	  end,
-    {G,Vs} = paste_graph(State#state.graph, State#state.clip, Pos),
-    State#state { graph=G, selected = Vs };
+    State#state { dna=DNA };
 command($s, _Selected, Mod, State) when Mod#keymod.ctrl ->
-    graph:save("graph.g", State#state.graph),
+    %% SAVE
     State;
-command($C, Selected, _Mod, State) ->
-    G = complete_graph(Selected, State#state.graph, State),
-    State#state { graph=G };
-command($I, Selected, _Mod, State) ->
-    G = complement_graph(Selected, State#state.graph, State),
-    State#state { graph=G };
-command($G, _Selected, _Mod, State) ->
-    Grid = case State#state.grid of
-	       undefined -> {8,8};
-	       _ -> undefined
-	   end,
-    State#state { grid = Grid };
 command($+, _Selected, _Mod, State) ->
-    %% fixme: make fixed steps? more predictable (yes!)
-    Zoom = min(100.0, State#state.zoom * 1.07),
-    %% io:format("Zoom factor ~w\n", [Zoom]),
-    State#state { zoom = Zoom };
+    Zoom = min(State#state.zoom + 1, ?MAX_ZOOM),
+    Zf = zoom_factor(Zoom),
+    NRows = nrows(State#state.winfo,State#state.height, Zf),
+    NColumns = ncolumns(State#state.winfo,State#state.width, Zf),
+    M = max(1, NColumns+State#state.noffs),
+    GW = trunc(M*Zf*?BASE_WIDTH),
+    GH = trunc(NRows*Zf*?BASE_HEIGHT),
+    Grid = resize_pixmap(State#state.grid,GW,GH,false),
+    set_base_font(State#state { zoom = Zoom, 
+				grid = Grid,
+				gwidth = GW, gheight = GH,
+				nrows=NRows, ncolumns=NColumns });
 command($-, _Selected, _Mod, State) ->
-    Zoom = max(0.01, State#state.zoom / 1.07),
-    %% io:format("Zoom factor ~w\n", [Zoom]),
-    State#state { zoom = Zoom };
-command($r, _Selected, _Mod, State) ->
-    ColorMap = graph_color:greedy(State#state.graph),
-    io:format("Colors = ~p\n", [ColorMap]),
-    G = maps:fold(fun(V,Color,Gi) ->
-			  graph:put_vertex(V, [{color,Color}], Gi)
-		  end, State#state.graph, ColorMap),
-    State#state { graph = G };
-command($q, _Selected, _Mod, State) ->
-    Vs = graph_clique:greedy(State#state.graph),
-    io:format("Clique = ~p\n", [Vs]),
-    State#state { selected = Vs };
-command($o, _Selected, _Mod, State) ->
-    Vs = graph_vertex_cover:greedy(State#state.graph),
-    io:format("Cover = ~p\n", [Vs]),
-    State#state { selected = Vs };
-    
+    Zoom = max(State#state.zoom - 1, ?MIN_ZOOM),
+    Zf = zoom_factor(Zoom),
+    NRows = nrows(State#state.winfo,State#state.height, Zf),
+    NColumns = ncolumns(State#state.winfo,State#state.width, Zf),
+    M = max(1, NColumns+State#state.noffs),
+    GW = trunc(M*Zf*?BASE_WIDTH),
+    GH = trunc(NRows*Zf*?BASE_HEIGHT),
+    Grid = resize_pixmap(State#state.grid,GW,GH,false),
+    set_base_font(State#state { zoom = Zoom, 
+				grid = Grid,
+				gwidth = GW, gheight = GH,
+				nrows=NRows, ncolumns=NColumns });
+
+command($1, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    State#state { view = base };
+command($2, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    State#state { view = amino };
+command($3, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    State#state { view = short };
+command($4, _Selected, Mod, State) when Mod#keymod.ctrl ->
+    State#state { view = compressed };
+
 command(Command, _Selected, _Mod, State) ->
     io:format("Command = ~p\n", [Command]),
     State.
 
-shape(?ELLIPSE)   -> ellipse;
-shape(?RECTANGLE) -> rectangle;
-shape(?ROUNDRECT) -> roundrect;
-shape(?TRIANGLE)  -> triangle.
+move_up(State,N) ->
+    Pos = max(0, State#state.pos - N*columns(State)),
+    DRows = State#state.drows + N,
+    State#state { pos = Pos, drows = DRows, ddir = -1 }.
 
-base(?A) -> $A;   %% adenine  -> $T
-base(?C) -> $C;   %% cytosine -> $G
-base(?G) -> $G;   %% guanine  -> $C
-base(?T) -> $T;   %% thymine  -> $A
-base(?U) -> $U;
-base(?W) -> $W;
-base(?S) -> $S;
-base(?M) -> $M;
-base(?K) -> $K;
-base(?R) -> $R;
-base(?Y) -> $Y;
-base(?B) -> $B;
-base(?D) -> $D;
-base(?H) -> $H;
-base(?V) -> $V;
-base(?N) -> $N;
-base(?Z) -> $Z.
+move_down(State,N) ->
+    Pos = State#state.pos + N*columns(State),  %% fixme limit upwards!
+    DRows = State#state.drows + N,
+    State#state { pos = Pos, drows = DRows, ddir = 1 }.
 
-%% use Base as color number 
-base_color(Base) -> Base.
+nrows(WI,H,Zf) ->
+    Height = H - (?TOP_OFFSET + ?BOTTOM_OFFSET + WI#window_info.bottom_bar),
+    max(1, trunc(Height / (Zf*?BASE_HEIGHT))).
 
-base_reverse(X) ->
-    ((X band 2#0001) bsl 3) bor
-    ((X band 2#0010) bsl 1) bor
-    ((X band 2#0100) bsr 1) bor
-    ((X band 2#1000) bsr 3).
+%% ncolumns is a multiple of 3
+ncolumns(_WI,W,Zf) ->
+    Width = W - (?LEFT_OFFSET + ?RIGHT_OFFSET),
+    max(1, 3*trunc(Width / (3*Zf*?BASE_WIDTH))).
 
--define(ld(Key, Env, Default),
-	proplists:get_value(Key, Env, Default#profile.Key)).
+rows(State) ->
+    State#state.nrows.
 
--define(ldc(Scheme, Key, Env, Default),
-	epx_profile:color_number(Scheme, ?ld(Key,Env,Default))).
+columns(State) ->
+    max(1, State#state.ncolumns+State#state.noffs).
 
 %% load #profile from environment
 load_profile(E) ->
     D = #profile{},
-    %% Special case
+    Zoom = load_value(zoom, E, D),
+    %% Special case - fixme!!!
     {Width,Height} =
 	case proplists:get_value(size, E, unset) of
 	    unset ->
-		{?ld(vertex_width, E, D),?ld(vertex_height, E, D)};
+		{load_value(base_width, E, D),load_value(base_height, E, D)};
 	    Size ->
 		{Size, Size}
 	end,
-    S = ?ld(scheme, E, D),
+    S = load_value(scheme, E, D),
     #profile {
-       scheme = S,
-       screen_color = ?ldc(S,screen_color, E, D),
-       selection_alpha = ?ld(selection_alpha, E, D),
-       selection_color = ?ldc(S,selection_color, E, D),
-       selection_border_width = ?ld(selection_border_width, E, D),
-       selection_border_color = ?ldc(S,selection_border_color, E, D),
-       vertex_shape           = ?ld(vertex_shape, E, D),
-       vertex_width           = Width,
-       vertex_height          = Height,
-       vertex_color           = ?ldc(S,vertex_color, E, D),
-       vertex_border_width     = ?ld(vertex_border_width, E, D),
-       vertex_border_color    = ?ldc(S,vertex_border_color, E, D),
-       vertex_select_color    = ?ldc(S,vertex_select_color, E, D),
-       vertex_select_border_width=?ld(vertex_select_border_width,E,D),
-       vertex_select_border_color=?ldc(S,vertex_select_border_color,E,D),
-       vertex_highlight_color=?ldc(S,vertex_highlight_color,E,D),
-       vertex_highlight_border_width=?ld(vertex_highlight_border_width,E,D),
-       vertex_highlight_border_color=?ldc(S,vertex_highlight_border_color,E,D),
-       edge_color = ?ldc(S,edge_color,E,D),
-       edge_select_color = ?ldc(S,edge_select_color,E,D),
-       edge_highlight_color = ?ldc(S,edge_highlight_color,E,D),
-       label_font = ?ld(label_font, E, D),
-       label_font_size = ?ld(label_font_size, E, D),
-       label_font_color = ?ldc(S,label_font_color,E,D),
-       menu_font_name = ?ld(menu_font_name, E, D),
-       menu_font_size = ?ld(menu_font_size, E, D),
-       menu_font_color = ?ldc(S,menu_font_color,E,D),
-       menu_background_color = ?ldc(S,menu_background_color,E,D),
-       menu_border_color = ?ldc(S,menu_border_color,E,D)
+       scheme          = S,
+       zoom            = Zoom,
+       screen_color    = load_color(S,screen_color, E, D),
+       selection_alpha = load_value(selection_alpha, E, D),
+       selection_color = load_color(S,selection_color, E, D),
+       selection_border_width = load_value(selection_border_width, E, D),
+       selection_border_color = load_color(S,selection_border_color, E, D),
+       base_width       = Width,
+       base_height      = Height,
+       border_width     = load_value(border_width, E, D),
+       border_color     = load_color(S,border_color, E, D),
+       select_color     = load_color(S,select_color, E, D),
+       select_border_width = load_value(select_border_width,E,D),
+       select_border_color = load_color(S,select_border_color,E,D),
+       highlight_color     = load_color(S,highlight_color,E,D),
+       highlight_border_width = load_value(highlight_border_width,E,D),
+       highlight_border_color = load_color(S,highlight_border_color,E,D),
+       label_font = load_value(label_font, E, D),
+       label_font_size = load_value(label_font_size, E, D),
+       label_font_color = load_color(S,label_font_color,E,D),
+       menu_font_name = load_value(menu_font_name, E, D),
+       menu_font_size = load_value(menu_font_size, E, D),
+       menu_font_color = load_color(S,menu_font_color,E,D),
+       menu_background_color = load_color(S,menu_background_color,E,D),
+       menu_border_color = load_color(S,menu_border_color,E,D)
       }.
+
+%% map of profile record names and indices in the record
+profile_index() ->
+    maps:from_list(lists:zip(record_info(fields, profile), 
+			     lists:seq(2,record_info(size,profile)))).
+
+%% load value from environment or profile
+load_value(Key, Env, Profile) ->
+    case proplists:get_value(Key, Env) of
+	undefined ->
+	    Ix = profile_index(),
+	    Pos = maps:get(Key, Ix),
+	    element(Pos, Profile);
+	Value ->
+	    Value
+    end.
+
+%% load RGB value from environment or profile
+load_color(Scheme, Key, Env, Profile) ->
+    Value = load_value(Key, Env, Profile),
+    epx_profile:color(Scheme, Value).
+
+color32({R,G,B}) -> (R bsl 16)+(G bsl 8)+(B);
+color32({A,R,G,B}) -> (A bsl 24)+(R bsl 16)+(G bsl 8)+(B).
+
+alpha_color(A,{_,R,G,B}) -> {A,R,G,B};
+alpha_color(A,{R,G,B}) -> {A,R,G,B};
+alpha_color(A,Name) when is_list(Name); is_atom(Name) ->
+    alpha_color(A, epx_color:from_name(Name)).
+
+add_color({R0,G0,B0},{R1,G1,B1}) ->
+    {max(255, R0+R1),max(255, G0+G1),max(255, B0+B1)};
+add_color({A0,R0,G0,B0},{A1,R1,G1,B1}) ->
+    {max(255, A0+A1),max(255, R0+R1),max(255, G0+G1),max(255, B0+B1)}.
+
+add_color(C1,C2,C3) ->
+    add_color(add_color(C1,C2),C3).
+
+add_color(C1,C2,C3,C4) ->
+    add_color(add_color(add_color(C1,C2),C3),C4).
 
 create_menu_profile(Profile) ->
     #menu_profile {
@@ -875,17 +989,25 @@ create_window_profile(Profile) ->
        bottom_bar_color  = Profile#profile.bottom_bar_color
       }.
 
-resize_pixmap(undefined, W, H) ->
+resize_pixmap(undefined, W, H, Attached) ->
     Pixmap = next_pixmap(W,H),
-    epx:pixmap_attach(Pixmap),
+    if Attached ->
+	    epx:pixmap_attach(Pixmap);
+       true ->
+	    ok
+    end,
     Pixmap;
-resize_pixmap(Pixmap, W, H) ->
+resize_pixmap(Pixmap, W, H, Attached) ->
     case epx:pixmap_info(Pixmap,[width,height]) of
 	[{width,PW},{height,PH}] when PW < W; PH < H ->
-	    epx:pixmap_detach(Pixmap),
-	    Pixmap1 = next_pixmap(W,H),
-	    epx:pixmap_attach(Pixmap1),
-	    Pixmap1;
+	    if Attached ->
+		    epx:pixmap_detach(Pixmap),
+		    Pixmap1 = next_pixmap(W,H),
+		    epx:pixmap_attach(Pixmap1),
+		    Pixmap1;
+	       true ->
+		    next_pixmap(W,H)
+	    end;
 	_ ->
 	    Pixmap
     end.
@@ -895,176 +1017,122 @@ next_pixmap(W,H) ->
     NPH = 1 bsl ceil(math:log2(H)),
     epx:pixmap_create(NPW, NPH, argb).
 
-complete_graph(Vs, G, State) ->
-    lists:foldl(
-      fun(V, Gi) ->
-	      lists:foldl(
-		fun(W, Gj) ->
-			case graph:is_edge(V, W, G) of
-			    true -> Gj;
-			    false ->
-				Color = (State#state.profile)#profile.edge_color,
-				graph:put_edge(V, W, 
-					       [{color,Color}],
-					       Gj)
-			end
-		end, Gi, Vs--[V])
-      end, G, Vs).
+%% cut selected positions from data and
+%% return edited data + copy of the data cut out.
+cut_data(Selected, Data) ->
+    Clip = copy_data(Selected,Data),
+    {remove_data(Selected,Data),Clip}.
 
-complement_graph(Vs, G, State) ->
-    lists:foldl(
-      fun(V, Gi) ->
-	      lists:foldl(
-		fun(W, Gj) ->
-			case graph:is_edge(V, W, G) of
-			    true ->
-				graph:remove_edge(V, W, Gj);
-			    false ->
-				Color = (State#state.profile)#profile.edge_color,
-				graph:put_edge(V, W, 
-					       [{color,Color}],
-					       Gj)
-			end
-		end, Gi, Vs--[V])
-      end, G, Vs).
+%% Copy selected data positions 
+copy_data(Selected,Data) ->
+    list_to_binary([get_base(Pos,Data) || Pos <- Selected]).
 
-%% copy a graph H into existing graph G on new coordinates
-paste_graph(G, H, {X,Y}) ->
-    Vs = graph:vertices(H),
-    Map = maps:from_list([{V,graph:unique_vertex()}||V <- Vs]),
-    Gn1 = lists:foldl(
-	    fun(V,Gi) ->
-		    Props0 = graph:get_vertex_by_id(V, H),
-		    {value,{x,Xv},Props1} = lists:keytake(x, 1, Props0),
-		    {value,{y,Yv},Props2} = lists:keytake(y, 1, Props1),
-		    A = maps:get(V, Map),
-		    Xi = Xv + X,
-		    Yi = Yv + Y,
-		    graph:put_vertex(A, [{x,Xi},{y,Yi}|Props2], Gi)
-	    end, G, Vs),
-    Gn2 = graph:fold_edges(
-	    fun(V,W,E,Gj) ->
-		    Props = graph:get_edge_by_id(E,H),
-		    A = maps:get(V, Map),
-		    B = maps:get(W, Map),
-		    graph:put_edge(A, B, Props, Gj)
-	    end, Gn1, H),
-    {Gn2, maps:fold(fun(_K,V,Acc) -> [V|Acc] end, [], Map)}.
-	    
+%% Remove selected data - remove from high positions so
+%% that offsets does not have to be recalculated
+remove_data(PosList, Data) ->
+    remove_data_(lists:reverse(PosList), Data).
 
-%% Copy selected vertices in G into a new graph
-copy_graph(Vs, G) ->
-    Gn = graph:new(false),
-    Map = maps:from_list([{V,graph:unique_vertex()}||V <- Vs]),
-    Gn1 = lists:foldl(
-	    fun(V,Gi) -> 
-		    Props = graph:get_vertex_by_id(V, G),
-		    A = maps:get(V, Map),
-		    graph:put_vertex(A, Props, Gi)
-	    end, Gn, Vs),
-    {Xc,Yc} = graph_center(Gn1),
-    Gn2 = offset_graph(Gn1, {-Xc,-Yc}),
-    Es = [{V,W} || V <- Vs, W <- Vs, V < W],
-    lists:foldl(
-      fun({V,W},Gj) ->
-	      case graph:is_edge(V, W, G) of
-		  true ->
-		      Props = graph:get_edge(V, W, G),
-		      A = maps:get(V, Map),
-		      B = maps:get(W, Map),
-		      graph:put_edge(A, B, Props, Gj);
-		  false ->
-		      Gj
-	      end
-      end, Gn2, Es).
+remove_data_([Pos|PosList], Data) ->
+    <<Before:Pos/binary, _, After/binary>> = Data,
+    remove_data_(PosList, <<Before/binary, After/binary>>);
+remove_data_([], Data) -> Data.
 
-cut_graph(Vs, G) ->
-    {kill_graph(Vs, G),copy_graph(Vs, G)}.
+%% Pase Clip onto every Selected position
+paste_data(PosList,Data,Clip) ->
+    paste_data_(PosList,0,Data,Clip).
+    
+paste_data_([Pos|PosList],Offs,Data,Clip) ->
+    Pos1 = Pos + Offs,
+    <<Before:Pos1/binary, _, After/binary>> = Data,
+    paste_data_(PosList,Offs+byte_size(Clip)-1,
+		<<Before/binary,Clip/binary,After/binary>>,Clip);
+paste_data_([], _, Data, _Clip) ->
+    Data.
 
-kill_graph(Vs, G) ->
-    remove_vertices(Vs, G).
+insert_data_before(PosList,Data,Clip) ->
+    insert_data_before_(PosList,0,Data,Clip).
+    
+insert_data_before_([Pos|PosList],Offs,Data,Clip) ->
+    Pos1 = Pos + Offs,
+    <<Before:Pos1/binary, After/binary>> = Data,
+    insert_data_before_(PosList,Offs+byte_size(Clip),
+			<<Before/binary,Clip/binary,After/binary>>,Clip);
+insert_data_before_([], _, Data, _Clip) ->
+    Data.
 
-remove_vertices([V|Vs], G) ->
-    remove_vertices(Vs, graph:remove_vertex(V, G));
-remove_vertices([], G) -> G.
+insert_data_after(PosList,Data,Clip) ->
+    insert_data_after_(PosList,0,Data,Clip).
+    
+insert_data_after_([Pos|PosList],Offs,Data,Clip) ->
+    Pos1 = Pos + Offs + 1,
+    <<Before:Pos1/binary, After/binary>> = Data,
+    insert_data_after_(PosList,Offs+byte_size(Clip),
+		       <<Before/binary,Clip/binary,After/binary>>,Clip);
+insert_data_after_([], _, Data, _Clip) ->
+    Data.
 
-move_vertices([V|Vs], Offset, G) ->
-    Pos = get_vertex_coord(V, G),
-    Pos1 = coords_add(Pos, Offset),
-    G1 = set_vertex_pos(V, G, Pos1),
-    move_vertices(Vs, Offset, G1);
-move_vertices([], _Offset, G) ->
-    G.
+toggle_data(PosList, Data) ->
+    N = length(PosList),
+    case lists:split(N div 2, PosList) of
+	{A,B} when N band 1 =:= 0 ->  
+	    swap_data(A, lists:reverse(B), Data);
+	{A,[_|B]} ->
+	    swap_data(A, lists:reverse(B), Data)
+    end.
 
-set_vertices([V|Vs], Attr, G) ->
-    G1 = graph:put_vertex(V, Attr, G),
-    set_vertices(Vs, Attr, G1);
-set_vertices([], _Attr, G) ->
-    G.
+swap_data([PosA|PosListA], [PosB|PosListB], Data) when PosA < PosB ->
+    Len = (PosB - PosA)-1,
+    <<Before:PosA/binary, A, Middle:Len/binary, B, After/binary>> = Data,
+    Data1 = <<Before/binary, B, Middle/binary, A, After/binary>>,
+    swap_data(PosListA, PosListB, Data1);
+swap_data([], [], Data) ->
+    Data.
 
-%% find center point in graph 
-graph_center(G) ->
-    graph_center(graph:vertices(G), G).
+%%
+%%  replace: replace selected positions
+%%  with data from Bin, rotate Bin if
+%%  Bin becomes empty
+%%
 
-graph_center([],_G) ->
-    {0,0};
-graph_center(Vs,G) ->
-    N = length(Vs),
-    {X,Y} = graph_center_(Vs,0,0,G),
-    {round(X/N), round(Y/N)}.
+replace_data(_PosList,Data,<<>>) ->
+    Data;
+replace_data(PosList,Data,Bin) ->
+    replace_data_(PosList,Data,Bin,Bin).
 
-graph_center_([V|Vs],X,Y,G) ->
-    {Xv,Yv} = get_vertex_coord(V, G),
-    graph_center_(Vs, Xv+X, Yv+Y, G);
-graph_center_([],X,Y,_G) ->
-    {X,Y}.
+replace_data_(PosList,Data,<<>>,Bin0) ->
+    replace_data_(PosList,Data,Bin0,Bin0);
+replace_data_([Pos|PosList],Data,<<B,Bin/binary>>,Bin0) ->
+    <<Before:Pos/binary, _, After/binary>> = Data,
+    replace_data_(PosList,<<Before/binary,B,After/binary>>, Bin, Bin0);
+replace_data_(_, Data, _, _Bin0) ->
+    Data.
 
-offset_graph(G, Offset) ->
-    move_vertices(graph:vertices(G), Offset, G).
+add_to_sel(Pos, Selected) ->
+    lists:sort([Pos|Selected]).
 
-%% scale vertex list
-scale_vertices([V|Vs], Scale, Center, G) ->
-    Pos = get_vertex_coord(V, G),
-    Pos1 = coords_add(scale(coords_sub(Pos, Center), Scale), Center),
-    G1 = set_vertex_pos(V, G, Pos1),
-    scale_vertices(Vs, Scale, Center, G1);
-scale_vertices([], _Scale, _Center, G) ->
-    G.
+select(State,{X,Y},_Selected) ->
+    if X =< ?LEFT_OFFSET ->
+	    [];
+       X >= State#state.width - ?RIGHT_OFFSET -> 
+	    [];
+       Y =< ?TOP_OFFSET ->
+	    [];
+       Y >= State#state.height - ?BOTTOM_OFFSET ->
+	    [];
+       true ->
+	    Zf = zoom_factor(State#state.zoom),
+	    %% translate XY into I,J and then POS
+	    I = trunc((Y-?TOP_OFFSET) / (Zf*?BASE_HEIGHT)),
+	    J = trunc((X-?LEFT_OFFSET) / (Zf*?BASE_WIDTH)),
+	    Pos = State#state.pos + I*columns(State) + J,
+	    %% io:format("X=~w,Y=~w,I=~w,J=~w,Pos=~w\n", [X,Y,I,J,Pos]),
+	    [Pos]
+    end.
 
-%% fixme only select first!
-select(Pos,G,Selected) ->
-    graph:fold_vertices(
-      fun(V, Sel) ->
-	      case lists:member(V, Sel) of
-		  false ->
-		      Rv = vertex_rect(V, G),
-		      case point_in_rect(Pos, Rv) of
-			  true ->
-			      [V | Sel];
-			  false ->
-			      Sel
-		      end;
-		  true ->
-		      Sel
-	      end
-      end, Selected, G).
+select_area(_State,_Rect,Selected) ->
+    %% FIXME:
+    Selected.
 
-select_area(Rect,G,Selected) ->
-    graph:fold_vertices(
-      fun(V, Sel) ->
-	      case lists:member(V, Sel) of
-		  false ->
-		      Rv = vertex_rect(V, G),
-		      case rect_overlap(Rect, Rv) of
-			  true ->
-			      [V | Sel];
-			  false ->
-			      Sel
-		      end;
-		  true ->
-		      Sel
-	      end
-      end, Selected, G).
 
 rect_offset({X,Y,W,H}, {X1,Y1}) ->
     {X+X1,Y+Y1,W,H}.
@@ -1081,25 +1149,6 @@ coords_to_rect({X0,Y0},{X1,Y1}) ->
     W = abs(X1-X0) + 1,
     H = abs(Y1-Y0) + 1,
     {X,Y,W,H}.
-
-get_vertex_coord(V,G) ->
-    {graph:get_vertex_by_id(V, x, G, 0), graph:get_vertex_by_id(V, y, G, 0)}.
-
-set_vertex_pos(V, G, {X,Y}) ->
-    graph:put_vertex(V, [{x,X},{y,Y}], G).
-
-vertex_rect(V, G) ->
-    Width = graph:get_vertex_by_id(V, width, G, 16),
-    Height = graph:get_vertex_by_id(V, height, G, 16),
-    X = graph:get_vertex_by_id(V, x, G, 0)-(Width div 2),
-    Y = graph:get_vertex_by_id(V, y, G, 0)-(Height div 2),
-    {X,Y,Width,Height}.
-
-vertex_shape(V, G) ->
-    graph:get_vertex_by_id(V, shape, G, ellipse).
-
-vertex_label(V, G) ->
-    graph:get_vertex_by_id(V, label, G, "").
 
 rect_overlap(R1,R2) ->
     case epx_rect:intersect(R1, R2) of
@@ -1127,11 +1176,6 @@ flush_redraw(State) ->
 	    State
     end.
 
-alpha_color(A,{_,R,G,B}) -> {A,R,G,B};
-alpha_color(A,{R,G,B}) -> {A,R,G,B};
-alpha_color(A,Name) when is_list(Name); is_atom(Name) ->
-    alpha_color(A, epx_color:from_name(Name)).
-
 menu(global) ->
     [
      {"Cut", "Ctrl+X"},
@@ -1141,169 +1185,480 @@ menu(global) ->
      {"---", ""},
      {"Save",  "Ctrl+S"},
      {"---", ""},
-     {"Complete", "Shift+C"},
-     {"Complement", "Shift+I"},
-     {"Snap to grid", "Shift+G"},
      {"Zoom in", "+"},
      {"Zoom out", "-"},
-     {"Colour", "R"},
-     {"Clique", "Q"},
-     {"Vertex Cover", "O"}
+     {"---", ""},
+     {"View Base", "Ctrl+1"},
+     {"View Amino", "Ctrl+2"},
+     {"View Short", "Ctrl+3"},
+     {"View Compressed", "Ctrl+4"}
     ].
 
+%%
+%% FIXME:
+%%   keep track on scroll up and scroll down
+%%   for wheel-up / wheel-down / key-up / key-down
+%%
 
-%% FIXME when using operation=move only draw the selected subgraph
-%% avoid redraw all node
-draw(State = #state { graph = G, selected = Selected, profile = Profile }) ->
-    Zoom = State#state.zoom,
-    Grid = State#state.grid,
+draw(State = #state { profile = Profile }) ->
+    Zf = zoom_factor(State#state.zoom),
     Scheme = Profile#profile.scheme,
     ScreenColor = epx_profile:color(Scheme, Profile#profile.screen_color),
     epx:pixmap_fill(State#state.pixels,ScreenColor),
+    %% epx:pixmap_fill(State#state.grid,ScreenColor),
     epx_gc:set_fill_style(solid),
-    Offset = if State#state.operation =:= move ->
-		     coords_sub(State#state.pt2,State#state.pt1);
-		true ->
-		     {0,0}
-	     end,
-    %% Draw info bar
-    %%   Zoom
-    %% | 1%       Pt1                  Pt2        Delta 
-    %% | 10000% | x:-1000.0 y:1000.2 | x:0  y:0 | dx:0  dy:0 | x:16 y:16 |
-    %% 
-    EdgeColor = epx_profile:color(Scheme, Profile#profile.edge_color),
-    graph:fold_edges(
-      fun(V,W,E,Acc) ->
-	      Vxy0 = get_vertex_coord(V, G),
-	      Vxy1 = case lists:member(V, Selected) of
-			 true -> coords_add(Vxy0,Offset);
-			 false -> Vxy0
-		     end,
-	      Vxy2 = snap(Vxy1, Grid),
-	      Vxy3 = scale(Vxy2, Zoom),
-	      Wxy0 = get_vertex_coord(W, G),
-	      Wxy1  = case lists:member(W, Selected) of
-			  true -> coords_add(Wxy0,Offset);
-			  false -> Wxy0
-		      end,
-	      Wxy2 = snap(Wxy1, Grid),
-	      Wxy3 = scale(Wxy2, Zoom),
-	      Color = graph:get_edge_by_id(E, color, G, EdgeColor),
-	      RGB = epx_profile:color(Scheme, Color),
-	      epx_gc:set_foreground_color(RGB),
-	      epx_gc:set_line_width(zm(1,Zoom)),
-	      epx:draw_line(State#state.pixels,Vxy3, Wxy3),
-	      Acc
-      end, [], G),
-
-    VertexColor = epx_profile:color(Scheme, Profile#profile.vertex_color),
-    VertexSelectBorderColor = epx_profile:color(Scheme,Profile#profile.vertex_select_border_color),
-    VertexBorderColor = epx_profile:color(Scheme,Profile#profile.vertex_border_color),
-    VertexHighLightColor = epx_profile:color(Scheme, Profile#profile.vertex_highlight_color),
-    VertexHighLightBorderColor = epx_profile:color(Scheme, Profile#profile.vertex_highlight_border_color),
-    graph:fold_vertices(
-      fun(V, Acc) ->
-	      Rect0 = vertex_rect(V, G),
-	      Rect1 =
-		  case lists:member(V, Selected) of
-		      true ->
-			  Bw1 = zm(Profile#profile.vertex_select_border_width,Zoom),
-			  epx_gc:set_border_width(Bw1),
-			  epx_gc:set_border_color(VertexSelectBorderColor),
-			  rect_offset(Rect0, Offset);
-		      false ->
-			  Bw2 = zm(Profile#profile.vertex_border_width,Zoom),
-			  epx_gc:set_border_width(Bw2),
-			  epx_gc:set_border_color(VertexBorderColor),
-			  Rect0
-		  end,
-	      Rect2 = snap(Rect1, Grid),
-	      Rect  = scale(Rect2, Zoom),
-	      %% high light vertext under pt2
-	      if State#state.operation =:= edge ->
-		      %% check with snap?
-		      case point_in_rect(State#state.pt2, Rect1) of 
-			  true ->
-			      Bw3 = zm(Profile#profile.vertex_highlight_border_width,Zoom),
-			      epx_gc:set_border_width(Bw3),
-			      epx_gc:set_border_color(VertexHighLightBorderColor),
-			      epx_gc:set_fill_color(VertexHighLightColor);
-			  false ->
-			      Color = graph:get_vertex_by_id(V,color,G, 
-							     VertexColor),
-			      RGB = epx_profile:color(Scheme, Color),
-			      epx_gc:set_fill_color(RGB)
-		      end;
-		 true ->
-		      Color = graph:get_vertex_by_id(V,color,G, 
-						     VertexColor),
-		      RGB = epx_profile:color(Scheme, Color),
-		      epx_gc:set_fill_color(RGB)
-	      end,
-	      case vertex_shape(V, G) of
-		  ellipse ->
-		      epx:draw_ellipse(State#state.pixels,Rect);
-		  rectangle ->
-		      epx:draw_rectangle(State#state.pixels,Rect);
-		  roundrect ->
-		      Rw = zm(8, Zoom),
-		      Rh = zm(8, Zoom),
-		      epx:draw_roundrect(State#state.pixels,Rect,Rw,Rh);
-		  triangle ->
-		      {X,Y,W,H} = Rect,
-		      P0 = {X + (W / 2), Y},
-		      P1 = {X, Y+H-1},
-		      P2 = {X+W-1, Y+H-1},
-		      epx:draw_triangle(State#state.pixels,
-					P0, P1, P2)
-	      end,
-	      draw_label(State,Rect,vertex_label(V,G)),
-	      Acc
-      end, [], G),
-    SelectionColor = epx_profile:color(Scheme, Profile#profile.selection_color),
-    EdgeHighLightColor = epx_profile:color(Scheme, Profile#profile.edge_highlight_color),
-    if State#state.pt1 =/= undefined, State#state.operation =:= menu ->
-	    epx_menu:draw(State#state.menu, State#state.pixels, 
-			  State#state.pt1);
-       State#state.pt1 =:= undefined; State#state.pt2 =:= undefined ->
-	    ok;
-       true ->
-	    case State#state.operation of
-		select ->
-		    Bw4 = zm(Profile#profile.selection_border_width,Zoom),
-		    Bc = Profile#profile.selection_border_color,
-		    epx_gc:set_border_color(epx_profile:color(Scheme,Bc)),
-		    epx_gc:set_border_width(Bw4),
-		    Color = alpha_color(Profile#profile.selection_alpha,
-					SelectionColor),
-		    epx_gc:set_fill_color(Color),
-		    epx_gc:set_fill_style(blend),
-		    Rect = scale(coords_to_rect(State#state.pt1,State#state.pt2), Zoom),
-		    epx:draw_rectangle(State#state.pixels, Rect);
-		edge ->
-		    epx_gc:set_foreground_color(EdgeHighLightColor),
-		    epx_gc:set_line_width(zm(1,Zoom)),
-		    Pt1 = scale(State#state.pt1, Zoom),
-		    Pt2 = scale(State#state.pt2, Zoom),
-		    epx:draw_line(State#state.pixels, Pt1, Pt2);
-		_ ->
-		    ok
-	    end
+    State1 = draw_dna(State, Zf, Scheme, Profile),  %% into grid!
+    %% FIXME: must use dpos!
+    draw_selected(State, Zf, Scheme, Profile),      %% into grid!
+    case State1#state.dpos of
+	0 ->
+	    epx:pixmap_copy_area(State#state.grid, State#state.pixels,
+				 0, 0, ?LEFT_OFFSET, ?TOP_OFFSET,
+				 State#state.gwidth,
+				 State#state.gheight);
+	DP ->
+	    TopH = Zf*DP*?BASE_HEIGHT,
+	    BotH = State#state.gheight - TopH,
+	    epx:pixmap_copy_area(State#state.grid, State#state.pixels,
+				 0, 0, ?LEFT_OFFSET, ?TOP_OFFSET+BotH,
+				 State#state.gwidth,
+				 TopH),
+	    epx:pixmap_copy_area(State#state.grid, State#state.pixels,
+				 0, TopH, ?LEFT_OFFSET, ?TOP_OFFSET,
+				 State#state.gwidth,
+				 BotH)
     end,
-    epx:pixmap_draw(State#state.pixels, State#state.window,
-		    0, 0, 0, 0, 
-		    State#state.width, State#state.height).
+    draw_bottom_bar(State),                     %% into pixels
+    if State#state.pt1 =/= undefined, State#state.operation =:= menu ->
+	    epx_menu:draw(State#state.menu, State#state.pixels,
+			  State#state.pt1);
+       true ->
+	    ok
+    end,
+    %% copy pixels to screen pixel
+    epx:pixmap_copy_to(State#state.pixels,State#state.screen),
+%%    epx:pixmap_copy_area(State#state.pixels,State#state.screen,
+%%			 0, 0, 0, 0, 
+%%			 State#state.width, State#state.height),
+    epx:pixmap_draw(State#state.screen, State#state.window,
+		    0, 0, 0, 0,
+		    State#state.width, State#state.height),
+    epx:sync(State#state.screen,State#state.window),
+    State1.
 
-%% draw label
-draw_label(_State, _Rect, "") ->
-    ok;
-draw_label(State, {X,Y,W,H}, Label) ->
-    WI = State#state.winfo,
-    X1 = X + trunc(W - WI#window_info.glyph_width) div 2,
-    Y1 = Y + trunc(H - WI#window_info.glyph_height) div 2,
+%%
+%% Draw DNA from top to bottom
+%%
+draw_rows(State) ->
+    NRows = rows(State),
+    DRows = State#state.drows,
+    if DRows =:= 0 -> NRows;
+       DRows > NRows -> NRows;
+       true -> DRows
+    end.
+
+draw_dna(State, Zf, Scheme, Profile) ->
+    N = draw_rows(State),
+    io:format("Draw ~w rows dpos=~w\n", [N, State#state.dpos]),
+    draw_dna(State,Zf,Scheme,Profile,0,N).
+
+draw_dna(State,Zf,Scheme,Profile,I,NRows) ->
+    case State#state.font_used of
+	undefined -> ignore;
+	#fi{ font=F } ->
+	    epx_gc:set_font(F)
+    end,
+    if Zf < 0.5 ->
+	    epx_gc:set_border_width(0); %% see the color better
+       true ->
+	    epx_gc:set_border_width(zm(Profile#profile.border_width,Zf)),
+	    epx_gc:set_border_color(
+	      epx_profile:color(Scheme,Profile#profile.border_color))
+    end,
+    M  = columns(State),
+    N  = rows(State),
+    P0 = State#state.pos + I*M,
+    DP = State#state.dpos,
+    DD = State#state.ddir,
+    DP1 = case State#state.view of
+	      base ->
+		  draw_base(State,NRows,P0,I,DP,DD,N,M,Zf);
+	      short ->
+		  draw_short(State,NRows,P0,I,DP,DD,N,M,Zf);
+	      amino ->
+		  draw_amino(State,NRows,P0,I,DP,DD,N,M,Zf);
+	      compressed ->
+		  draw_compressed(State,NRows,P0,I,DP,DD,N,M,Zf)
+	  end,
+    io:format("dpos' = ~w\n", [DP1]),
+    State#state { dpos = DP1, drows = 0, ddir = 0 }.
+
+
+-record(ci,
+	{ amino,
+	  short,
+	  compressed,
+	  color
+	}).
+
+-define(CI(A,S,Z,C), #ci{amino=(A),short=(S),compressed=(Z),color=(C)}).
+-define(CN(A,B,C), [A,B,C]).
+-define(A, $A).
+-define(C, $C).
+-define(G, $G).
+-define(U, $T).
+
+%% color coded property
+-define(nonpolar, 16#ffe75f).
+-define(polar,    16#b3dec0).
+-define(basic,    16#bbbfe0).
+-define(acidic,   16#f8b7d3).
+-define(start,    16#00ff00).
+-define(stop,     16#b0b0b0).
+-define(none,     16#000000).
+
+-define(DEF, ?CI("Non", "N", "NNN", ?none)).  %% PCR read error?
+
+codon() ->
+    #{
+      ?CN(?G,?C,?U) => ?CI("Ala","A","GCN",?nonpolar),
+      ?CN(?G,?C,?C) => ?CI("Ala","A","GCN",?nonpolar),
+      ?CN(?G,?C,?A) => ?CI("Ala","A","GCN",?nonpolar),
+      ?CN(?G,?C,?G) => ?CI("Ala","A","GCN",?nonpolar),
+      ?CN(?C,?G,?U) => ?CI("Arg","R","CGN",?basic),
+      ?CN(?C,?G,?C) => ?CI("Arg","R","CGN",?basic),
+      ?CN(?C,?G,?A) => ?CI("Arg","R","CGN",?basic),
+      ?CN(?C,?G,?G) => ?CI("Arg","R","CGN",?basic),
+      ?CN(?A,?G,?A) => ?CI("Arg","R","AGR",?basic),
+      ?CN(?A,?G,?G) => ?CI("Arg","R","AGR",?basic),
+      ?CN(?A,?A,?U) => ?CI("Asn","N","AAY",?polar),
+      ?CN(?A,?A,?C) => ?CI("Asn","N","AAY",?polar),
+      ?CN(?G,?A,?U) => ?CI("Asp","D","GAY",?acidic),
+      ?CN(?G,?A,?C) => ?CI("Asp","D","GAY",?acidic),
+      ?CN(?U,?G,?U) => ?CI("Cys","C","UGY",?polar),
+      ?CN(?U,?G,?C) => ?CI("Cys","C","UGY",?polar),
+      ?CN(?C,?A,?A) => ?CI("Gln","Q","CAR",?polar),
+      ?CN(?C,?A,?G) => ?CI("Gln","Q","CAR",?polar),
+      ?CN(?G,?A,?A) => ?CI("Glu","E","GAR",?acidic),
+      ?CN(?G,?A,?G) => ?CI("Glu","E","GAR",?acidic),
+      ?CN(?G,?G,?U) => ?CI("Gly","G","GGN",?nonpolar),
+      ?CN(?G,?G,?C) => ?CI("Gly","G","GGN",?nonpolar),
+      ?CN(?G,?G,?A) => ?CI("Gly","G","GGN",?nonpolar),
+      ?CN(?G,?G,?G) => ?CI("Gly","G","GGN",?nonpolar),
+      ?CN(?C,?A,?U) => ?CI("His","H","CAY",?basic),
+      ?CN(?C,?A,?C) => ?CI("His","H","CAY",?basic),
+      ?CN(?A,?U,?U) => ?CI("Ile","I","AUH",?nonpolar),
+      ?CN(?A,?U,?C) => ?CI("Ile","I","AUH",?nonpolar),
+      ?CN(?A,?U,?A) => ?CI("Ile","I","AUH",?nonpolar),
+      ?CN(?U,?U,?A) => ?CI("Leu","L","UUR",?nonpolar),
+      ?CN(?U,?U,?G) => ?CI("Leu","L","UUR",?nonpolar),
+      ?CN(?C,?U,?U) => ?CI("Leu","L","CUN",?nonpolar), 
+      ?CN(?C,?U,?C) => ?CI("Leu","L","CUN",?nonpolar),
+      ?CN(?C,?U,?A) => ?CI("Leu","L","CUN",?nonpolar),
+      ?CN(?C,?U,?G) => ?CI("Leu","L","CUN",?nonpolar),
+      ?CN(?A,?A,?A) => ?CI("Lys","K","AAR",?basic),
+      ?CN(?A,?A,?G) => ?CI("Lys","K","AAR",?basic),
+      ?CN(?U,?U,?U) => ?CI("Phe","F","UUY",?nonpolar),
+      ?CN(?U,?U,?C) => ?CI("Phe","F","UUY",?nonpolar),
+      ?CN(?C,?C,?U) => ?CI("Pro","P","CCN",?nonpolar),
+      ?CN(?C,?C,?C) => ?CI("Pro","P","CCN",?nonpolar),
+      ?CN(?C,?C,?A) => ?CI("Pro","P","CCN",?nonpolar),
+      ?CN(?C,?C,?G) => ?CI("Pro","P","CCN",?nonpolar),
+      ?CN(?U,?C,?U) => ?CI("Ser","S","UCN",?polar),
+      ?CN(?U,?C,?C) => ?CI("Ser","S","UCN",?polar),
+      ?CN(?U,?C,?A) => ?CI("Ser","S","UCN",?polar),
+      ?CN(?U,?C,?G) => ?CI("Ser","S","UCN",?polar),
+      ?CN(?A,?G,?U) => ?CI("Ser","S","AGY",?polar),
+      ?CN(?A,?G,?C) => ?CI("Ser","S","AGY",?polar),
+      ?CN(?A,?C,?U) => ?CI("Thr","T","ACN",?polar),
+      ?CN(?A,?C,?C) => ?CI("Thr","T","ACN",?polar),
+      ?CN(?A,?C,?A) => ?CI("Thr","T","ACN",?polar),
+      ?CN(?A,?C,?G) => ?CI("Thr","T","ACN",?polar),
+      ?CN(?U,?G,?G) => ?CI("Trp","W","UGG",?nonpolar),
+      ?CN(?U,?A,?U) => ?CI("Tyr","Y","UAY",?polar),
+      ?CN(?U,?A,?C) => ?CI("Tyr","Y","UAY",?polar),
+      ?CN(?G,?U,?U) => ?CI("Val","V","GUN",?nonpolar),
+      ?CN(?G,?U,?C) => ?CI("Val","V","GUN",?nonpolar),
+      ?CN(?G,?U,?A) => ?CI("Val","V","GUN",?nonpolar),
+      ?CN(?G,?U,?G) => ?CI("Val","V","GUN",?nonpolar),
+      ?CN(?A,?U,?G) => ?CI("STA","^","AUG",?start),
+      %% ?CN(?A,?U,?G) => ?CI("Met","M","AUG"),
+      ?CN(?U,?A,?A) => ?CI("STP","$","URA",?stop),
+      ?CN(?U,?G,?A) => ?CI("STP","$","URA",?stop),
+      ?CN(?U,?A,?G) => ?CI("STP","$","UAG",?stop)
+     }.
+
+complement($A) -> $T;
+complement($C) -> $G;
+complement($G) -> $C;
+complement($T) -> $A;
+complement(L) when is_list(L) ->
+    [complement(B) || B <- L].
+
+amino([A,B,C | L]) ->
+    CI = maps:get(?CN(A,B,C), codon(), ?DEF),
+    [M,N,O] = CI#ci.amino,
+    [M, N, O | amino(L)];
+amino(_) ->
+    [].
+
+%%
+%% Draw DNA as separate bases
+%%
+draw_base(_State,0,_Pos,_I,DP,_DD,N,_M,_Zf) ->
+    mod(DP, N);
+draw_base(State,K,Pos,I,DP,DD,N,M,Zf) ->
+    Row = get_row(Pos,State#state.dna,M),
+    DP1 = mod(DP,N),
+    Y = DP1*?BASE_HEIGHT,
+    draw_base_row(State,Row,Y,0,Zf),
+    draw_base(State,K-1,Pos+M,I+1,DP1+DD,DD,N,M,Zf).
+
+draw_base_row(State,<<Base,Row/binary>>,Y,X,Zf) ->
+    Rect = scale_rect(X,Y,?BASE_WIDTH,?BASE_HEIGHT, Zf),
+    RGB = element(Base, State#state.color_map),
+    epx_gc:set_fill_color(RGB),
+    epx:draw_rectangle(State#state.grid,Rect),
+    draw_name1(State,Rect,[Base]),
+    draw_base_row(State,Row,Y,X+?BASE_WIDTH,Zf);
+draw_base_row(_State,<<>>,_Y,_X,_Zf) ->
+    ok.
+%%
+%% Draw amino codon with short name
+%%
+draw_short(_State,0,_Pos,_I,DP,_DD,N,_M,_Zf) ->
+    mod(DP, N);
+draw_short(State,K,Pos,I,DP,DD,N,M,Zf) ->
+    Row = get_row(Pos,State#state.dna,M),
+    DP1 = mod(DP,N),
+    Y = DP1*?BASE_HEIGHT,
+    draw_short_row(State,Row,Y,0,Zf),
+    draw_short(State,K-1,Pos+M,I+1,DP1+DD,DD,N,M,Zf).
+
+draw_short_row(State,<<B1,B2,B3,Row/binary>>,Y,X,Zf) ->
+    CI = maps:get(?CN(B1,B2,B3), codon(), ?DEF),
+    Rect = scale_rect(X,Y,?BASE_WIDTH,?BASE_HEIGHT, Zf),
+    epx_gc:set_fill_color(CI#ci.color),
+    epx:draw_rectangle(State#state.grid,Rect),
+    draw_name1(State,Rect,CI#ci.short),
+    draw_short_row(State,Row,Y,X+?BASE_WIDTH,Zf);
+draw_short_row(_State,<<>>,_Y,_X,_Zf) ->
+    ok.
+
+%%
+%% Draw DNA with amino compressed name 3*char
+%%
+draw_compressed(_State,0,_Pos,_I,DP,_DD,N,_M,_Zf) ->    
+    mod(DP, N);
+draw_compressed(State,K,Pos,I,DP,DD,N,M,Zf) ->
+    Row = get_row(Pos,State#state.dna,M),
+    DP1 = mod(DP,N),
+    Y = DP1*?BASE_HEIGHT,
+    draw_compressed_row(State,Row,Y,0,Zf),
+    draw_compressed(State,K-1,Pos+M,I+1,DP1+DD,DD,N,M,Zf).
+
+draw_compressed_row(State,<<B1,B2,B3,Row/binary>>,Y,X,Zf) ->
+    CI = maps:get(?CN(B1,B2,B3), codon(), ?DEF),
+    Rect = scale_rect(X,Y,3*?BASE_WIDTH,?BASE_HEIGHT, Zf),
+    epx_gc:set_fill_color(CI#ci.color),
+    epx:draw_rectangle(State#state.grid,Rect),
+    draw_name3(State,Rect,CI#ci.compressed),
+    draw_compressed_row(State,Row,Y,X+3*?BASE_WIDTH,Zf);
+draw_compressed_row(_State,<<>>,_Y,_X,_Zf) ->
+    ok.
+
+%%
+%% Draw DNA with amino acid names
+%%
+draw_amino(_State,0,_Pos,_I,DP,_DD,N,_M,_Zf) ->    
+    mod(DP, N);
+draw_amino(State,K,Pos,I,DP,DD,N,M,Zf) ->
+    Row = get_row(Pos,State#state.dna,M),
+    DP1 = mod(DP,N),
+    Y = DP1*?BASE_HEIGHT,
+    draw_amino_row(State,Row,Y,0,Zf),
+    draw_amino(State,K-1,Pos+M,I+1,DP1+DD,DD,N,M,Zf).
+
+draw_amino_row(State,<<B1,B2,B3,Row/binary>>,Y,X,Zf) ->
+    CI = maps:get(?CN(B1,B2,B3), codon()),
+    Rect = scale_rect(X,Y,3*?BASE_WIDTH,?BASE_HEIGHT, Zf),
+    epx_gc:set_fill_color(CI#ci.color),
+    epx:draw_rectangle(State#state.grid,Rect),
+    draw_name3(State,Rect,CI#ci.amino),
+    draw_amino_row(State,Row,Y,X+3*?BASE_WIDTH,Zf);
+draw_amino_row(_State,<<>>,_Y,_X,_Zf) ->
+    ok.
+
+
+%% draw string with one letter
+draw_name1(State, {X,Y,W,H}, Name=[_]) ->
+    case State#state.font_used of
+	undefined ->
+	    ignore;
+	#fi { width=GW, height=GH, ascent=GA } ->
+	    %% io:format("label=~s, rect=~w\n", [[Char], R]),
+	    X1 = X + trunc(W - GW) div 2,
+	    Y1 = Y + trunc(H - GH) div 2,
+	    epx_gc:set_foreground_color(?TEXT_COLOR),
+	    %% epx_gc:set_foreground_color(State#state.fcolor),
+	    epx:draw_string(State#state.grid, X1, Y1+1+GA, Name)
+    end.
+
+%% string with 3-letters
+draw_name3(State, {X,Y,W,H}, Amino=[_,_,_]) ->
+    case State#state.font_used of
+	undefined ->
+	    ignore;
+	#fi { width=GW, height=GH, ascent=GA } ->
+	    %% io:format("label=~s, rect=~w\n", [[Char], R]),
+	    X1 = X + trunc(W - 3*GW) div 2,
+	    Y1 = Y + trunc(H - GH) div 2,
+	    epx_gc:set_foreground_color(?TEXT_COLOR),
+	    %% epx_gc:set_foreground_color(State#state.fcolor),
+	    epx:draw_string(State#state.grid, X1, Y1+1+GA, Amino)
+    end.
+
+%%
+%% Draw selected bases
+%%
+
+draw_selected(State, Zf, Scheme, Profile) ->
+    Start = State#state.pos,
+    Stop  = Start + rows(State)*columns(State)-1,
+    SelectColor = epx_profile:color(Scheme,Profile#profile.select_color),
+    epx_gc:set_border_width(zm(Profile#profile.selection_border_width,Zf)),
+    epx_gc:set_border_color(
+      epx_profile:color(Scheme,Profile#profile.selection_border_color)),
+    epx_gc:set_fill_color(SelectColor),
+    draw_selected_(State, State#state.selected, Start, Stop, Zf).
+
+draw_selected_(State, [Pos|Selected], Start, Stop, Zf) when
+      Pos >= Start, Pos =< Stop ->
+    Pos0 = Pos - Start,  %% relative to upper left corder
+    M = columns(State),
+    I = Pos0 div M,
+    J = Pos0 rem M,
+    X0 = J*?BASE_WIDTH,
+    Y0 = I*?BASE_HEIGHT,
+    {X,Y,W,H} = scale_rect(X0,Y0,?BASE_WIDTH-1,?BASE_HEIGHT-1,Zf),
+    SH = max(1, trunc(?SEL_HEIGHT*Zf)),
+    Rect = {X,Y+(H-SH),W,SH},
+    epx:draw_rectangle(State#state.grid,Rect),
+    draw_selected_(State,Selected,Start,Stop,Zf);
+draw_selected_(State,[_|Selected], Start, Stop, Zf) ->
+    %% if Selection is sorted the end here!
+    draw_selected_(State,Selected,Start,Stop,Zf);
+draw_selected_(_State,[],_Start,_Stop,_Zf) ->
+    ok.
+
+draw_bottom_bar(State) ->
+    case bar(State) of
+	{_Left,_Right,_Top,0} ->
+	    State;
+	{_Left,_Right,_Top,Bottom} ->
+	    epx_gc:set_font(State#state.font),
+	    epx_gc:set_fill_style(solid),
+	    epx_gc:set_fill_color(bottom_bar_color(State)), 
+	    X0 = 0,
+	    Y0 = State#state.height-Bottom,
+	    DrawRect = {X0,Y0,State#state.width,Bottom},
+	    epx:draw_rectangle(State#state.pixels, DrawRect),
+	    epx_gc:set_foreground_color({0,0,0}),
+	    epx_gc:set_fill_style(none),
+	    epx:draw_rectangle(State#state.pixels, DrawRect),
+
+	    %% Display Pos:  Column:  Rows: Offs: Zoom:
+
+	    draw_text(X0+10, Y0, 100, Bottom-2,
+		      "Pos: "++ integer_to_list(State#state.pos), State),
+	    draw_text(X0+110, Y0, 100, Bottom-2,
+		      "Columns: "++ integer_to_list(columns(State)), State),
+	    draw_text(X0+210, Y0, 100, Bottom-2,
+		      "Rows:"++ integer_to_list(rows(State)), State),
+	    draw_text(X0+310, Y0, 130, Bottom-2, 
+		      "Offs: "++ integer_to_list(State#state.noffs),State),
+	    draw_text(X0+410, Y0, 130, Bottom-2, 
+		      "Zoom: "++ integer_to_list(State#state.zoom),State),
+	    State
+    end.
+
+draw_text(X0, Y0, _W, _H, Text, State) ->
+    X = X0,
     GA = glyph_ascent(State),
-    epx_gc:set_foreground_color(State#state.fcolor),
-    epx:draw_string(State#state.pixels, X1, Y1+1+GA, Label).
+    Y = Y0+1+GA,
+    epx_gc:set_foreground_color(?TEXT_COLOR),
+    epx:draw_string(State#state.pixels, X, Y, Text).
+
+bottom_bar_color(State) ->
+    P = State#state.profile,
+    Color = P#profile.bottom_bar_color,
+    epx_profile:color(P#profile.scheme, Color).
+
+bar(#state { winfo = WI }) ->
+    #window_info { left_bar = L, right_bar = R,
+		   top_bar = T, bottom_bar = B } = WI,
+    {L, R, T, B}.
+
+get_base(Pos, DNA) ->
+    try binary:at(DNA, Pos) of  %% range check instead?
+	Base -> Base
+    catch
+	error:_ -> $Z
+    end.
+
+get_row(Pos, DNA, MaxLen) ->
+    case DNA of
+	<<_:Pos/binary, Row:MaxLen/binary, _/binary>> ->
+	    Row;
+	<<_:Pos/binary, Row/binary>> ->
+	    Row;
+	_  ->
+	    <<>>
+    end.
+
+
+base_to_digit($T) -> $0;
+base_to_digit($G) -> $1;
+base_to_digit($C) -> $2;
+base_to_digit($A) -> $3.
+
+digit_to_base($0) -> $T;
+digit_to_base($1) -> $G;
+digit_to_base($2) -> $C;
+digit_to_base($3) -> $A.
+
+dna_to_number(DNA) when is_binary(DNA) ->
+    dna_to_number(binary_to_list(DNA));
+dna_to_number(DNA) when is_list(DNA) ->
+    list_to_integer([base_to_digit(B)||B<-DNA], 4).
+
+number_to_dna(Number) when is_integer(Number), Number >= 0 ->
+    [digit_to_base(I) || I <- integer_to_list(Number, 4)].
+
+string_to_dna(String) ->
+    lists:append([byte_to_dna(B) || B <- String]).
+
+byte_to_dna(B) ->
+    [digit_to_base(((B bsr 6) band 3)+$0),
+     digit_to_base(((B bsr 4) band 3)+$0),
+     digit_to_base(((B bsr 2) band 3)+$0),
+     digit_to_base((B band 3)+$0)].
+
+%% set font that closest match the size needed
+set_base_font(State) ->
+    Zf = zoom_factor(State#state.zoom),
+    FWidth = trunc(?BASE_WIDTH*Zf),  %% size we need to draw
+    Used = find_base_font_(FWidth, State#state.font_list, undefined),
+    State#state { font_used = Used }.
+
+find_base_font_(Width, [FI=#fi{width=W}|Fis], Found) ->
+    if W < Width -> 
+	    find_base_font_(Width,Fis,FI);
+       true ->
+	    Found
+    end;
+find_base_font_(_Width, [], Found) ->
+    Found.
 
 
 glyph_width(#state { winfo = WI }) -> WI#window_info.glyph_width.
@@ -1312,56 +1667,35 @@ glyph_ascent(#state { winfo = WI }) -> WI#window_info.glyph_ascent.
 glyph_descent(#state { winfo = WI }) -> WI#window_info.glyph_descent.
 
 
-zm(W,Zoom) -> max(1, W*Zoom).
-zm(X,Y,Zoom) -> {X*Zoom, Y*Zoom}.
+%% convert Zoom integer -10..0..10  into zoom factor
+zoom_factor(Zoom) ->
+    math:pow(1.25, Zoom).
 
-izm(W,Zoom) -> max(1, W/Zoom).
-izm(X,Y,Zoom) -> {X/Zoom, Y/Zoom}.
+zm(W,Zf) -> max(1, W*Zf).
+zm(X,Y,Zf) -> {X*Zf, Y*Zf}.
 
-snap(PointOrRect, undefined) -> PointOrRect;
-snap({X,Y}, {Xs, Ys}) ->
-    {Xs*trunc(X / Xs), Ys*trunc(Y / Ys)};
-snap({X,Y,W,H}, {Xs, Ys}) ->
-    {Xs*trunc(X / Xs), Ys*trunc(Y / Ys), W, H}.
+mod(A, N) ->
+    if A >= 0, A < N -> A;
+       true ->
+	    R = A rem N,
+	    if R < 0 -> R + N;
+	       true -> R
+	    end
+    end.
 
-scale(PointOrRect, Scale) when Scale == 1 -> PointOrRect;
+scale(PointOrRect, Zoom) when Zoom == 1 -> 
+    PointOrRect;
 scale({X,Y}, Zoom) ->
-    {X*Zoom, Y*Zoom};
+    scale_point(X,Y,Zoom);
 scale({X,Y,W,H}, Zoom) ->
+    scale_rect(X,Y,W,H,Zoom).
+
+scale_point(X,Y,Zoom) ->
+    {X*Zoom, Y*Zoom}.
+
+scale_rect(X,Y,W,H,Zoom) ->
     {X*Zoom, Y*Zoom, max(1,W*Zoom), max(1,H*Zoom)}.
 
-base_map() ->
-    #{ $A => ?A, $C => ?C, $G => ?G, $T => ?T,
-       $W => ?W, $S => ?S, $M => ?M, $K => ?K,
-       $R => ?R, $Y => ?Y, $B => ?B, $D => ?D,
-       $H => ?H, $V => ?V, $N => ?N, $Z => ?Z }.
-
-base_rmap() ->
-    #{ ?A => $A, ?C => $C, ?G => $G, ?T => $T,
-       ?W => $W, ?S => $S, ?M => $M, ?K => $K,
-       ?R => $R, ?Y => $Y, ?B => $B, ?D => $D,
-       ?H => $H, ?V => $V, ?N => $N, ?Z => $Z }.
-
-dna_layout(Bs, G) ->
-    dna_layout(Bs, G, 0, 0).
-
-dna_layout(Bs, G, X, Y) when X+?BASE_WIDTH+2 > ?WIDTH ->
-    dna_layout(Bs, G, 0, Y+?BASE_HEIGHT+2);
-dna_layout([B|Bs], G, X, Y) ->
-    Bi = maps:get(B, base_map(), ?Z),
-    Br = maps:get(Bi, base_rmap(), $Z),
-    V = graph:unique_vertex(),
-    G1 = graph:put_vertex(V,
-			  [{x,X},{y,Y},
-			   {color,base_color(Bi)},
-			   {width,?BASE_WIDTH},
-			   {height,?BASE_HEIGHT},
-			   {label, [Br]},
-			   {shape,rectangle}], G),
-    dna_layout(Bs,G1, X+?BASE_WIDTH+2,Y);
-dna_layout([], G, _X, _Y) ->
-    G.
-    
 %% catch up with motions
 flush_motions(Window) ->
     receive

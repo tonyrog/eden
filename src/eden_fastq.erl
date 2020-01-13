@@ -22,6 +22,13 @@
 %% -define(dbg(F,A), io:format((F),(A))).
 -define(dbg(F,A), ok).
 
+%% simple merge all bases 
+load(File) ->
+    List = fold(File,
+		fun([_Id,Seq,_Plus,_Qual], Acc) ->
+			[Seq|Acc]
+		end, []),
+    lists:reverse(List).
 
 scan(File) ->
     scan(File,".*",[]).
@@ -129,7 +136,7 @@ trim_nl(Bin) ->
 
 
 decode_quality(Q) ->
-    list_to_tuple([ decode_q(C, sanger) || <<C>> <= Q ]).
+    list_to_tuple([ p(decode_q(C,sanger), sanger) || <<C>> <= Q ]).
 
 decode_q(C,sanger) when C >= 33, C =< 126 ->
     P = C - 33,  %% P in range 0..93
@@ -150,10 +157,16 @@ decode_q(C,illumina_18) when C >= 33, C =< 126 ->
     P = C - 33,  %% P in range 0..93
     P.
 
-phred_q(P, sanger) ->
-    -10*math:log10(P);
-phred_q(P, illumina_10) ->
-    -10*math:log10(P/(1-P)).
+%% proablity of incorrect base call
+p(Q, sanger) -> 
+    math:pow(10,-Q/10);
+p(Q, illumina) -> 
+    1/(1/math:pow(10,Q/-10)+1).
+
+q(P, sanger) ->
+    trunc(-10*math:log10(P));
+q(P, illumina_10) ->
+    trunc(-10*math:log10(P/(1-P))).
 
 open_read(File) ->
     file:open(File, [raw,read,binary,read_ahead,compressed]).

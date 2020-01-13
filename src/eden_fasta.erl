@@ -7,6 +7,8 @@
 %%
 -module(eden_fasta).
 
+-export([load/1]).  %% load DNA sequence
+
 -compile(export_all).
 
 -ifdef(OTP_RELEASE). %% this implies 21 or higher
@@ -17,6 +19,13 @@
 -define(GET_STACK(_), erlang:get_stacktrace()).
 -endif.
 
+load(File) ->
+    RList = 
+	fold(File,
+	     fun([_ID,_Pos,Seq],Acc) ->
+		     [Seq|Acc]
+	     end, []),
+    lists:reverse(RList).
 
 scan(File) ->
     scan(File,".*",[]).
@@ -109,7 +118,7 @@ fold_(In, Pos, ID, Buf, Fun, Acc) ->
 trim_nl(Bin) ->
     Size = byte_size(Bin)-1,
     case Bin of
-	<<Bin1:Size,"\n">> -> Bin1;
+	<<Bin1:Size/binary,"\n">> -> Bin1;
 	_ -> Bin
     end.
 
