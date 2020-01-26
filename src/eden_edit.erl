@@ -261,7 +261,7 @@ init(Options) ->
 	      },
     Events = 
 	[key_press,key_release,
-	 %% wheel, left, right, %% motion-left-button
+	 wheel, left, right, %% motion-left-button
 	 configure,button_press,button_release] ++
 	case ?USE_EXPOSURE of
 	    true -> [expose];
@@ -322,6 +322,8 @@ init(Options) ->
 		    menu    = Menu,
 		    dna     = <<>>,
 		    pos     = 0,
+		    drows   = NRows,
+		    ddir    = 1,
 		    winfo   = WInfo,
 		    color_map = ColorMap,
 		    font = Fi0#fi.font,
@@ -550,6 +552,7 @@ handle_epx_event(Event, State) ->
 	    end;
 
 	{button_press, [right], _Where={X,Y,_Zm}} ->
+	    io:format("press right enable menu\n", []),
 	    %% MI = State#state.menu_info,
 	    %% epx_gc:set_font(MI#menu_info.font),
 	    %% Menu = menu(global),
@@ -1230,6 +1233,7 @@ draw(State = #state { profile = Profile }) ->
     end,
     draw_bottom_bar(State),                     %% into pixels
     if State#state.pt1 =/= undefined, State#state.operation =:= menu ->
+	    io:format("draw menu\n", []),
 	    epx_menu:draw(State#state.menu, State#state.pixels,
 			  State#state.pt1);
        true ->
@@ -1480,7 +1484,7 @@ draw_amino(State,K,Pos,I,DP,DD,N,M,Zf) ->
     draw_amino(State,K-1,Pos+M,I+1,DP1+DD,DD,N,M,Zf).
 
 draw_amino_row(State,<<B1,B2,B3,Row/binary>>,Y,X,Zf) ->
-    CI = maps:get(?CN(B1,B2,B3), codon()),
+    CI = maps:get(?CN(B1,B2,B3), codon(), ?DEF),
     Rect = scale_rect(X,Y,3*?BASE_WIDTH,?BASE_HEIGHT, Zf),
     epx_gc:set_fill_color(CI#ci.color),
     epx:draw_rectangle(State#state.grid,Rect),
